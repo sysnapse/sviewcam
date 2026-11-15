@@ -359,13 +359,9 @@ pub async fn run(
         });
 
         backoff = cfg.reconnect.initial;
-        if let Some(at) = gap_open_at.take() {
-            let now = clock.now_ms();
-            let ms = now.saturating_sub(at);
-            rep.gaps.push(StreamGap { at_ms: at.saturating_sub(t0), ms, reason: gap_reason.clone() });
-            rep.max_gap_ms = rep.max_gap_ms.max(ms);
-            on_event(Event::Reconnected { after_ms: now.saturating_sub(t0), gap_ms: ms });
-        }
+        // N1（PM 2026-11-15 R7 裁定）：空窗收口點不在 PLAY 200，而在本會話首個 RTP 到達時
+        // （見下方 `session_rtp == 0` 分支）。R1 定義的空窗是「RST→本會話首個 RTP」；
+        // 若在 PLAY 成功即收口，握手全綠但永不送 RTP 的相機會被誤記成已續流。
 
         let mut last_seq: Option<u16> = None;
         let mut last_hb = clock.now_ms();
@@ -398,6 +394,23 @@ pub async fn run(
                                 // 只有 PLAY 成功不算——即時拒絕的會話同樣會 PLAY 成功然後 <10 s 被 RST。
                                 immediate_streak = 0;
                                 midstream_backoff = cfg.reconnect.midstream_initial;
+                                // N1：空窗收口點＝本會話首個 RTP 到達時（R1 語義）。量到的 ms 是
+                                // 「RST→首個 RTP」；PLAY 成功但永不送 RTP 的會話不會走到這裡，
+                                // 故其空窗不記錄、不發 Reconnected，改由 recv_timeout 分類計入失敗。
+                                if let Some(at) = gap_open_at.take() {
+                                    let now = clock.now_ms();
+                                    let ms = now.saturating_sub(at);
+                                    rep.gaps.push(StreamGap {
+                                        at_ms: at.saturating_sub(t0),
+                                        ms,
+                                        reason: gap_reason.clone(),
+                                    });
+                                    rep.max_gap_ms = rep.max_gap_ms.max(ms);
+                                    on_event(Event::Reconnected {
+                                        after_ms: now.saturating_sub(t0),
+                                        gap_ms: ms,
+                                    });
+                                }
                             }
                             session_rtp += 1;
                             // 序號只認「向前」：向後（亂序／重複）不動 high-water mark，

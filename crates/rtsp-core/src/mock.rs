@@ -30,6 +30,9 @@ pub struct ConnPlan {
     pub sdp: Option<String>,
     /// 模擬 DESCRIBE 非 200。
     pub describe_status: Option<u16>,
+    /// PLAY 成功之後永不送 RTP（recv_rtp 永遠 pending），用來測 recv_timeout 分支：
+    /// 相機握手全綠卻不送流，N1 要求這種會話不得被記成「已續流」。
+    pub hang: bool,
 }
 
 impl ConnPlan {
@@ -40,7 +43,14 @@ impl ConnPlan {
             end: EndMode::Rst,
             sdp: None,
             describe_status: None,
+            hang: false,
         }
+    }
+
+    /// 握手全綠但永不送 RTP（recv_timeout 前零 RTP）。
+    pub fn hang(mut self) -> Self {
+        self.hang = true;
+        self
     }
 
     pub fn end(mut self, mode: EndMode) -> Self {
@@ -278,6 +288,9 @@ impl Link for MockLink {
     }
 
     async fn recv_rtp(&mut self) -> Result<Vec<u8>> {
+        if self.plan.hang {
+            std::future::pending::<()>().await;
+        }
         match self.plan.packets.get(self.idx) {
             Some(p) => {
                 self.idx += 1;
