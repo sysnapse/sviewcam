@@ -56,6 +56,23 @@ async fn replays_fixture_and_matches_declared_expectations() {
     assert_eq!(report.rst_immediate_reject, 0);
     assert_eq!(report.rst_midstream, 0);
     assert_eq!(report.backoff_ms, vec![0, 0], "定時回收不得白等退避");
+    // R4（PM 2026-11-15 第 3 輪裁定）：直接斷言空窗值本身，不可只靠條數或由 backoff 間接推論。
+    // PM 允許「mock clock 下 gap_ms==0，或寫明上限」。實測此 fixture 不是 0：
+    // fixture 在 RST 與下一段連線之間腳本化了 1 s 握手延遲（61000→62000、122000→123000），
+    // 首個 RTP 再晚 3 ms，故定時回收的直測空窗為 ~1003 ms；backoff_ms==[0,0] 另證其中不含退避等待。
+    // 上限 2000 ms：任何 ≥1 s 的退避被誤加（含 MidStream 1 s 起步）都會令 g.ms ≥ 2000 而紅；
+    // 下限 500 ms：若空窗追蹤壞掉（恒 0）同樣會紅。
+    for (i, g) in report.gaps.iter().enumerate() {
+        assert!(
+            (500..2000).contains(&g.ms),
+            "第 {i} 次斷流空窗應為 fixture 腳本的 ~1 s 握手延遲且不含退避（500..2000 ms），實測 {g:?}"
+        );
+    }
+    assert!(
+        (500..2000).contains(&report.max_gap_ms),
+        "最大空窗應為 ~1 s 握手延遲（500..2000 ms），實測 {}",
+        report.max_gap_ms
+    );
     assert_eq!(report.lost_packets, 4, "缺口應為 4 個封包");
     assert_eq!(report.seq_gaps[0].lost, 4);
     assert!(events > 0);
