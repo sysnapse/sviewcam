@@ -159,7 +159,9 @@ async fn timed_recycle_reconnects_immediately_with_zero_backoff() {
     assert_eq!(report.rst_midstream, 0);
     assert_eq!(report.backoff_ms, vec![0], "定時回收不得白等退避");
     assert_eq!(report.gaps.len(), 1);
-    assert_eq!(report.gaps[0].ms, 0, "定時回收的重連空窗應為 0");
+    // N1：空窗收口在「本會話首個 RTP」，故值＝退避 0 ＋ 本 fixture 的首包間隔（PacedFactory 5000 ms）；
+    // 退避是否歸零仍由上面的 backoff_ms 斷言。
+    assert_eq!(report.gaps[0].ms, 5000, "定時回收不睡退避，空窗只含 RST→首個 RTP 的 5000 ms");
 }
 
 /// 即時拒絕（§11.2 第二列）：PLAY 後 <10 s 被 RST 且從未收到 RTP →
@@ -224,8 +226,10 @@ async fn midstream_rst_resets_backoff_after_rtp_success() {
         "§11.2：中途 RST 退避在重連成功（收到 RTP）後重置，第二次的空窗不得變 2 s"
     );
     assert_eq!(report.gaps.len(), 2);
-    assert_eq!(report.gaps[0].ms, 1000, "空窗要與實際退避一致");
-    assert_eq!(report.gaps[1].ms, 1000);
+    // N1：空窗＝退避 ＋ RST→首個 RTP 的首包間隔（PacedFactory 1000 ms），故 1000+1000。
+    // 「空窗不得隨退避加倍」仍由兩者相等證明。
+    assert_eq!(report.gaps[0].ms, 2000, "空窗＝退避 1000 ＋ 首包間隔 1000");
+    assert_eq!(report.gaps[1].ms, 2000);
 }
 
 /// 中途 RST（§11.2 第三列）的另一條規則：接連斷流、中間那一次沒有收到任何 RTP 時，退避要加倍。
@@ -256,9 +260,23 @@ async fn midstream_rst_doubles_when_reconnect_gets_no_rtp() {
     assert_eq!(report.rst_immediate_reject, 0, "無 RTP 但 age=20 s 不是即時拒絕");
     assert_eq!(report.rst_timed_recycle, 0);
     assert_eq!(report.backoff_ms, vec![1000, 2000], "第一次 1 s 起，未收 RTP 則第二次加倍");
-    assert_eq!(report.gaps.len(), 2);
-    assert_eq!(report.gaps[0].ms, 1000);
-    assert_eq!(report.gaps[1].ms, 2000, "空窗要與加倍後的退避一致");
+    // N1：第二段重連「PLAY 成功但零 RTP」不算續流，故不另記一次空窗——
+    // 這次斷流與下一次成功收流合成一段連續空窗（一次 RST→首個 RTP）。
+    assert_eq!(report.gaps.len(), 1, "零 RTP 的重連不另記空窗");
+    // 已開的空窗不覆寫（PM 2026-11-15 R8 裁定）：空窗由第一次 RST 開，直到本會話首個 RTP 收口，
+    // 中間那次 20 s 「PLAY 成功但零 RTP」的等待本身也是相機沒送流的時間，必須計入。
+    // 值＝退避 1000 ＋ 第二段零 RTP 的 20 000 ＋ 退避 2000 ＋ 首包間隔 1000。
+    assert_eq!(
+        report.gaps[0].ms, 24_000,
+        "空窗＝RST1→首個 RTP（1000+20000+2000+1000），實測 {:?}",
+        report.gaps[0]
+    );
+    // 釘住語義：空窗不得因中間會話零 RTP 而縮短。
+    assert!(
+        report.gaps[0].ms >= 1000 + 2000,
+        "空窗不得因中間會話零 RTP 而縮短成只剩最後一次退避：實測 {}",
+        report.gaps[0].ms
+    );
 }
 
 /// 同一會話內序號向後跳（RTP 走 UDP，會亂序到達）不得算成丟包。
