@@ -263,7 +263,20 @@ async fn midstream_rst_doubles_when_reconnect_gets_no_rtp() {
     // N1：第二段重連「PLAY 成功但零 RTP」不算續流，故不另記一次空窗——
     // 這次斷流與下一次成功收流合成一段連續空窗（一次 RST→首個 RTP）。
     assert_eq!(report.gaps.len(), 1, "零 RTP 的重連不另記空窗");
-    assert_eq!(report.gaps[0].ms, 3000, "最終退避 2000 ＋ 首包間隔 1000");
+    // 已開的空窗不覆寫（PM 2026-11-15 R8 裁定）：空窗由第一次 RST 開，直到本會話首個 RTP 收口，
+    // 中間那次 20 s 「PLAY 成功但零 RTP」的等待本身也是相機沒送流的時間，必須計入。
+    // 值＝退避 1000 ＋ 第二段零 RTP 的 20 000 ＋ 退避 2000 ＋ 首包間隔 1000。
+    assert_eq!(
+        report.gaps[0].ms, 24_000,
+        "空窗＝RST1→首個 RTP（1000+20000+2000+1000），實測 {:?}",
+        report.gaps[0]
+    );
+    // 釘住語義：空窗不得因中間會話零 RTP 而縮短。
+    assert!(
+        report.gaps[0].ms >= 1000 + 2000,
+        "空窗不得因中間會話零 RTP 而縮短成只剩最後一次退避：實測 {}",
+        report.gaps[0].ms
+    );
 }
 
 /// 同一會話內序號向後跳（RTP 走 UDP，會亂序到達）不得算成丟包。
