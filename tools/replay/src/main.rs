@@ -73,7 +73,9 @@ async fn main() -> std::process::ExitCode {
     };
 
     let mut log = |ev: Event| match ev {
-        Event::Rst { at_ms, reason } => println!("斷流 t+{at_ms}ms：{reason}"),
+        Event::Rst { at_ms, reason, class } => {
+            println!("斷流 t+{at_ms}ms（{}）：{reason}", class.as_str())
+        }
         Event::Reconnected { after_ms, gap_ms } => {
             println!("重連完成 t+{after_ms}ms（空窗 {gap_ms}ms）")
         }

@@ -46,7 +46,16 @@ async fn replays_fixture_and_matches_declared_expectations() {
 
     assert_eq!(rst_at.len(), 2, "應記錄兩次 RST 時刻：{rst_at:?}");
     assert_eq!(report.gaps.len(), 2, "每次斷流都要留空窗記錄");
-    assert!(report.gaps.iter().all(|g| g.ms > 0), "空窗時長應 > 0：{:?}", report.gaps);
+    // fixture 兩次 RST 都在 PLAY 後約 60 s，屬 §11.2「定時回收」：設計內行為，
+    // 正確做法是立即重連（退避歸零），因此空窗為 0 才是對的，不能要求 > 0。
+    assert_eq!(
+        report.rst_timed_recycle, 2,
+        "兩次都應判為定時回收：timed={} immediate={} mid={}",
+        report.rst_timed_recycle, report.rst_immediate_reject, report.rst_midstream
+    );
+    assert_eq!(report.rst_immediate_reject, 0);
+    assert_eq!(report.rst_midstream, 0);
+    assert_eq!(report.backoff_ms, vec![0, 0], "定時回收不得白等退避");
     assert_eq!(report.lost_packets, 4, "缺口應為 4 個封包");
     assert_eq!(report.seq_gaps[0].lost, 4);
     assert!(events > 0);

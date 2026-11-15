@@ -130,8 +130,8 @@ async fn main() -> std::process::ExitCode {
         Event::Playing { session, sprop_sets } => {
             println!("[{}] PLAY 成功（Session {session}，sprop {sprop_sets} 組）", stamp())
         }
-        Event::Rst { at_ms, reason } => {
-            println!("[{}] 斷流 t+{at_ms}ms：{reason}", stamp())
+        Event::Rst { at_ms, reason, class } => {
+            println!("[{}] 斷流 t+{at_ms}ms（{}）：{reason}", stamp(), class.as_str())
         }
         Event::Reconnected { after_ms, gap_ms } => {
             println!("[{}] 已重連完成 t+{after_ms}ms（空窗 {gap_ms}ms）", stamp())

@@ -26,7 +26,7 @@ pub use error::{Error, Result};
 pub use link::{Link, LinkFactory};
 pub use replay::{ReplayFactory, ReplayFixture};
 pub use rtsp::USER_AGENT;
-pub use session::{run, Event, ReconnectPolicy, Report, SessionConfig};
+pub use session::{run, Event, ReconnectPolicy, Report, RstClass, SessionConfig};
 pub use sink::{FileSink, NalSink, NullSink, VecSink};
 
 /// 相機 Soft-AP 的預設 RTSP 根位址。

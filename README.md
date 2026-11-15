@@ -34,6 +34,94 @@ SVIEW_TOKEN=<32 位數字> cargo run -p probe -- \
 `probe` 結束會印 JSON 統計：`rtp_packets`、`rtp_bytes`、`seq_gaps`、`gaps`（重連空窗）、`reconnects`。
 沒有 RTP 時 exit code 1；權杖缺失時 exit 2（不會重試）。
 
+## 故障注入 harness（重連鑑別力）
+
+驗收標準 2 要求「故障注入 harness 能檢出錯誤重連實作」，這要靠變異測試證明，
+**不是**靠「測試全綠」推論。`scripts/mutant_harness.sh` 把
+`crates/rtsp-core/src/session.rs` 的重連決策逐個改成已知錯誤的實作（每次只改一件事、
+從暫存副本重建），跑 `cargo test -p rtsp-core --no-fail-fast`，判定規則是：
+
+1. `good`（未變異）必須全綠，否則後續一切檢出無意義；
+2. 每個 mutant 必須讓**指定的那一條測試**紅，只紅在別處不算檢出；
+3. 注入前會先核對錨點在原始碼裡恰好一個，錨點失效直接 exit 4——否則「注入點消失」會被
+   誤報成「測試抓不到」或反過來讓 mutant 靜默退化成 good；
+4. 編譯不過**不算檢出**，另報 `COMPILE_ERROR` 並 exit 4，避免把「改壞到編不過」冒充成
+   「測試抓到」；
+5. 結束以 sha256 核對原始碼已還原（還原失敗 exit 3）。
+
+| mutant | 注入的錯誤 | 必須紅的測試 |
+|---|---|---|
+| `naive` | 斷流後不重連，把 RST 當正常結束 | `rst_classes::midstream_rst_resets_backoff_after_rtp_success` |
+| `mutantA` | 重連但不睡退避（立刻重連） | `rst_classes::midstream_rst_doubles_when_reconnect_gets_no_rtp` |
+| `mutantB` | 只要不連號就當缺口（不容忍向後／亂序） | `rst_classes::backward_seq_jump_within_session_is_not_counted_as_loss` |
+| `mutantC` | 不分類：定時回收被當中途 RST（白等一次退避） | `rst_classes::timed_recycle_reconnects_immediately_with_zero_backoff` |
+
+四個 mutant 分別對應 protocol 文檔 §11.2（2026-11-15 14:3x 裁定為三類觸發）的
+定時回收、即時拒絕、中途 RST，加上序號處理。
+
+### 兩條由 harness 逼出來的修正（不是先想好的）
+
+1. **mutantB 原本逃逸**。原因是舊測試只覆蓋「重連後序號重置」（那發生在會話邊界，
+   `last_seq` 本來就該重置）與「向前缺口」，**沒有任何一條測試碰到「同一會話內序號向後跳」**。
+   RTP 走 UDP，亂序屬預期行為，而 §12 未證清單並沒有排除它。補了
+   `backward_seq_jump_within_session_is_not_counted_as_loss` 與
+   `forward_gap_within_session_is_counted_once` 兩條後才發現：原本的實作把 `last_seq`
+   無條件更新成最新收到的序號，於是向後那包會把 high-water mark 拉回去，
+   令下一個正常包被**重複**計成缺口。現行實作（`session.rs` 序號段）只認「向前」：
+   重複包與向後包計入 `out_of_order`，不動 mark。
+2. **環形距離的符號陷阱**。`p.seq.wrapping_sub(prev) as i32` 對 u16 來說永遠非負，
+   所以「`ahead < 0` 視為向後」那種分支是死碼，寫的時候看著合理、跑起來永遠不成立。
+   現行以 u16 距離 `d` 判斷：`d == 1` 連號、`1 < d < 0x4000` 向前缺口、
+   `d == 0 || d >= 0xC000` 亂序／重複、`0x4000 <= d < 0xC000` 屬「無法區分丟了大半圈與
+   來源重置序號」的 §12 未證情況，選擇推進 mark 但不計丟包（留在舊 mark 會令之後每包
+   都判成異常，卡死檢測是更壞的失敗模式）。
+
+### 跑法
+
+```sh
+sh scripts/mutant_harness.sh              # good + 4 個 mutant，全部檢出才 exit 0
+sh scripts/mutant_harness.sh mutantB      # 只跑一個
+sh scripts/verify_all.sh                  # workspace 測試 → replay → harness → git 狀態
+```
+
+只用 POSIX sh ＋ busybox 工具（cargo、awk、sed、grep、sha256sum）。**刻意不用 python3**：
+devbox 的 rust 模板是 alpine，容器內以 uid 1000 執行、`apk add` 會被拒，因此 python 版
+harness 在驗收環境跑不起來；`fixtures/gen_sview_m0.py`（重生 fixture）仍需要 python3，
+要在有 python3 的機器上跑，commit 的是生成的 `.jsonl`。
+
+
+## 重連策略：按 RST 類別分別退避（protocol 文檔 §11.2）
+
+單一退避不夠：相機有兩類已知 RST，加上時序尚未解釋的觸發。`session.rs` 在每次斷流時先分類，
+再按類別決定退避（`RstClass`、`ReconnectPolicy`）：
+
+| 類別 | 判別 | 動作 |
+|---|---|---|
+| `TimedRecycle` 定時回收 | 距上次 PLAY 成功 ≥ 45 s | 立即重連、退避歸零（設計內行為，不是故障） |
+| `ImmediateReject` 即時拒絕 | 距 PLAY < 10 s 且本會話從未收到 RTP | 0.5→1→2→4 s（夾在 `max` 10 s 之下）；連續 5 次即停並報錯 |
+| `MidStream` 中途 RST | 其他，**含未解釋的觸發**（例如觀測到的 ~31 s 短拉） | 1 s 起、每次加倍、成功收流後重置 |
+
+另外有重連風暴上限：10 分鐘內超過 40 次重連即停止並上報，不讓它 quietly 燒 CPU。
+「成功」的定義是**收到本會話第一個 RTP**，不是 PLAY 成功——即時拒絕的會話同樣會 PLAY 成功
+然後 <10 s 被 RST，用 PLAY 當成功會令 5 次上限永遠不觸發。
+
+報告多了四個欄位：`rst_timed_recycle`、`rst_immediate_reject`、`rst_midstream`、`backoff_ms`。
+
+**門檻是設定值，不是寫死的常數。** `ReconnectPolicy` 的 `timed_recycle_after`（預設 45 s）、
+`immediate_reject_before`（預設 10 s）、`immediate_ladder`、`immediate_limit`（5）、
+`midstream_initial`（1 s）、`storm_window`／`storm_max_reconnects`（10 分鐘／40 次）全部由呼叫方提供，
+`session.rs` 內沒有任何 `60` 秒硬編碼。實測 Δ 分桶與三類的對應：
+
+| 實測 Δ | 落到哪一類 | 備註 |
+|---|---|---|
+| <10 s 且從未收 RTP | `ImmediateReject` | 即時拒絕，走階梯退避 |
+| 約 31 s（Mine 觀測 5 次，exit 0，成因未定案） | `MidStream` | 未解釋的觸發不另設假設；要分開處理就把 `immediate_reject_before` 調成 32 s 之類，屬設定變更 |
+| 約 60 s（59–64 s 定時回收） | `TimedRecycle` | 由 `timed_recycle_after` 判定，不看「60」這個數字 |
+| 其他（有收流後被斷） | `MidStream` | 1 s 起、加倍、成功後重置 |
+
+**不要寫死 60 秒**：60–64 s 只是「≥45 s」這個門檻下的一個觀測值；若日後實測發現回收週期改變，
+改設定即可，不用改狀態機。
+
 ## 權杖紀律
 
 SViewWifi 權杖由使用者從自己的配對資料／抓包取得：
