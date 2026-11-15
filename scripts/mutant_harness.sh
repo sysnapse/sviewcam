@@ -14,11 +14,13 @@
 #   mutantA   退避失效（斷流後立即重連，不睡 backoff） → 中途 RST 加倍退避
 #   mutantB   不容忍序號重置（重連後新會話 seq 從 1 起會被誤報缺包）→ 合成 RST 重連
 #   mutantC   不分類（把定時回收當成中途 RST，白等退避）→ 定時回收退避必為 0
+#   mutantD   空窗收口點退回 PLAY 200（N1 前的行為）→ 空窗量成 RST→PLAY 而非 RST→首個 RTP
+#   mutantE   每次 RST 都重開空窗（R8 前的行為，覆寫已開的空窗）→ 連續停機只量到最後一段
 #
 # 只動 session.rs 一個檔案、一個缺陷一版，mutant 一律從 .bak 重建，結束還原並以 sha256 核對。
 # POSIX sh＋busybox 工具即可（devbox 的 rust 模板沒有 python3，也不得假設能裝套件）。
 #
-# 用法：  sh scripts/mutant_harness.sh              # good + 4 mutants
+# 用法：  sh scripts/mutant_harness.sh              # good + 5 mutants
 #         sh scripts/mutant_harness.sh naive        # 只跑指定 mutant
 # 結束碼：0 全部檢出；1 有 mutant 逃逸或 good 不綠；3 原始碼還原失敗；4 harness／注入／編譯錯誤。
 
@@ -71,6 +73,12 @@ anchor_check() {
         mutantC)
             N=$(grep -c '^            RstClass::TimedRecycle$' "$BAK" || true)
             [ "$N" = 1 ] || { echo "錨點失效：mutantC 的分桶行有 $N 處（應為 1）"; exit 4; } ;;
+        mutantD)
+            N=$(grep -cF '// N1（PM 2026-11-15 R7 裁定）' "$BAK" || true)
+            [ "$N" = 1 ] || { echo "錨點失效：mutantD 的 N1 收口點註解有 $N 處（應為 1）"; exit 4; } ;;
+        mutantE)
+            N=$(grep -c '^        if gap_open_at.is_none() {$' "$BAK" || true)
+            [ "$N" = 1 ] || { echo "錨點失效：mutantE 的「已開空窗不覆寫」有 $N 處（應為 1）"; exit 4; } ;;
     esac
 }
 
@@ -107,6 +115,25 @@ inject() {
             M=$(grep -c 'RstClass::TimedRecycle =>' "$SRC" || true)
             [ "$M" = 3 ] || { echo "注入失敗：mutantC 波及 match arm（$M 個，應為 3）"; exit 4; }
             ;;
+        mutantD)
+            # N1 前的行為：在 PLAY 段就把 gap 收口（take gap_open_at），
+            # 於是空窗量到 RST→PLAY（本 fixture 為 1003 ms），而非 RST→首個 RTP（1500 ms）。
+            # 單行注入：整段收口邏輯壓成一行，插在 PLAY 段 `backoff = ...` 之後的 N1 註解之前。
+            ins='if let Some(at) = gap_open_at.take() { let now = clock.now_ms(); let ms = now.saturating_sub(at); rep.gaps.push(StreamGap { at_ms: at.saturating_sub(t0), ms, reason: gap_reason.clone() }); rep.max_gap_ms = rep.max_gap_ms.max(ms); on_event(Event::Reconnected { after_ms: now.saturating_sub(t0), gap_ms: ms }); }'
+            awk -v ins="$ins" '
+                { if (index($0, "// N1（PM 2026-11-15 R7 裁定）") > 0) print "        " ins
+                  print }' "$BAK" > "$SRC"
+            N=$(grep -c 'gap_open_at.take()' "$SRC" || true)
+            [ "$N" = 2 ] || { echo "注入失敗：mutantD 應有 2 處 take（PLAY 與首個 RTP），實得 $N"; exit 4; }
+            ;;
+        mutantE)
+            # R8 前的行為：每次 RST 都 gap_open_at = Some(now)／gap_reason = reason，
+            # 於是「RST → PLAY 成功但零 RTP → RST」的前段停機被覆寫掉，空窗只量最後一段。
+            awk '{ if ($0 == "        if gap_open_at.is_none() {") print "        if true {"; else print }' "$BAK" > "$SRC"
+            N=$(grep -c '^        if gap_open_at.is_none() {$' "$SRC" || true)
+            [ "$N" = 0 ] || { echo "注入失敗：mutantE 仍留有 is_none 判斷（$N）"; exit 4; }
+            M=$(grep -c '^        if gap_open_at.is_none() {$' "$SRC" || true)
+            [ "$M" = 0 ] || { echo "注入失敗：mutantE 注入無效"; exit 4; } ;;
         good)
             cp "$BAK" "$SRC"
             ;;
@@ -122,6 +149,8 @@ require_of() {
         mutantA) echo 'midstream_rst_doubles_when_reconnect_gets_no_rtp|immediate_reject_uses_ladder_then_stops_after_five' ;;
         mutantB) echo 'backward_seq_jump_within_session_is_not_counted_as_loss' ;;
         mutantC) echo 'timed_recycle_reconnects_immediately_with_zero_backoff' ;;
+        mutantD) echo 'replays_fixture_and_matches_declared_expectations|gap_is_measured_from_rst_to_first_rtp' ;;
+        mutantE) echo 'midstream_rst_doubles_when_reconnect_gets_no_rtp' ;;
         good)    echo '' ;;
     esac
 }
@@ -177,7 +206,7 @@ echo "repo: $(pwd)"
 cargo --version
 
 if [ "$TARGET" = all ]; then
-    for m in good naive mutantA mutantB mutantC; do
+    for m in good naive mutantA mutantB mutantC mutantD mutantE; do
         echo "-- $m"
         run_one "$m"
     done
@@ -195,5 +224,5 @@ echo "$HITS" | grep -q 'NOTGREEN' && RC=1
 echo "$HITS" | grep -qE 'escaped|wrongtest' && RC=1
 echo "$HITS" | grep -qE 'compile_error|noresult' && RC=4
 [ "$RC" = 0 ] || echo "結論：未達標（exit $RC）"
-[ "$RC" = 0 ] && echo "結論：baseline 全綠，4 個 mutant 全部由指定測試檢出"
+[ "$RC" = 0 ] && echo "結論：baseline 全綠，6 個 mutant 全部由指定測試檢出"
 exit "$RC"
