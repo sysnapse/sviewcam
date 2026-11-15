@@ -5,3 +5,7 @@
 *.mkv
 /reports/
 *.log
+
+# 變異 harness 與 fixture 重生的本機產物
+__pycache__/
+*.pyc

@@ -1,0 +1,65 @@
+{"type":"meta","name":"sview-m0-synthetic","note":"合成樣本（非真機錄製）：2 次 RST 重連、1 個序號缺口","expected":{"connections":3,"reconnects":2,"seq_gaps":1,"nals":42}}
+{"type":"conn","index":0}
+{"type":"rtsp_s2c","t_ms":1000,"data":"RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: OPTIONS,DESCRIBE,SETUP,PLAY,PAUSE,TEARDOWN\r\n\r\n"}
+{"type":"rtsp_s2c","t_ms":1001,"data":"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Base: rtsp://192.168.1.1/test.264/\r\nContent-Type: application/sdp\r\nServer: sunshine/1.11\r\nContent-Length: 365\r\n\r\nv=0\r\no=-2209971456 2209971456 IN IP4 192.168.1.1\r\ns=Unnamed\r\nc=IN IP4 192.168.1.11\r\nt=0 0\r\na=recvonly\r\nm=video 5004 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=640029;sprop-parameter-sets=AAAAAWdNADKWNUBQAWtNwEBAQIA=,AAAAAWjuMbI=;\r\na=control:trackID=0\r\na=x-dimensions:2560,1440\r\na=SViewWifi:01234567890123456789012345678901\r\n"}
+{"type":"rtsp_s2c","t_ms":1002,"data":"RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: fixture-session;timeout=60\r\nTransport: RTP/AVP;unicast;client_port=20000-20001;destination=192.168.245.65;source=192.168.245.96;server_port=0-0\r\n\r\n"}
+{"type":"rtsp_s2c","t_ms":1003,"data":"RTSP/1.0 200 OK\r\nCSeq: 4\r\nSession: fixture-session\r\nRange: npt=0-\r\n\r\n"}
+{"type":"rtp","t_ms":1500,"data":"gGAAAQAAA+gRIjNEZQEC"}
+{"type":"rtp","t_ms":1540,"data":"gGAAAgAAB9ARIjNEfIWquw=="}
+{"type":"rtp","t_ms":1580,"data":"gGAAAwAAB9ARIjNEfAXM3Q=="}
+{"type":"rtp","t_ms":1620,"data":"gGAABAAAB9ARIjNEfEXu"}
+{"type":"rtp","t_ms":1660,"data":"gGAABQAAC7gRIjNEQQA="}
+{"type":"rtp","t_ms":1700,"data":"gGAABgAAC7kRIjNEQQE="}
+{"type":"rtp","t_ms":1740,"data":"gGAABwAAC7oRIjNEQQI="}
+{"type":"rtp","t_ms":1780,"data":"gGAACAAAC7sRIjNEQQM="}
+{"type":"rtp","t_ms":1820,"data":"gGAACQAAC7wRIjNEQQQ="}
+{"type":"rtp","t_ms":1860,"data":"gGAACgAAC70RIjNEQQU="}
+{"type":"rtp","t_ms":1900,"data":"gGAACwAAC74RIjNEQQY="}
+{"type":"rtp","t_ms":1940,"data":"gGAADAAAC78RIjNEQQc="}
+{"type":"rtp","t_ms":1980,"data":"gGAADQAAC8ARIjNEQQg="}
+{"type":"rtp","t_ms":2020,"data":"gGAADgAAC8ERIjNEQQk="}
+{"type":"rtp","t_ms":2060,"data":"gGAADwAAC8IRIjNEQQo="}
+{"type":"rtp","t_ms":2100,"data":"gGAAEAAAC8MRIjNEQQs="}
+{"type":"rtp","t_ms":2140,"data":"gGAAEQAAC8QRIjNEQQw="}
+{"type":"rtp","t_ms":2180,"data":"gGAAEgAAC8URIjNEQQ0="}
+{"type":"rtp","t_ms":2220,"data":"gGAAEwAAC8YRIjNEQQ4="}
+{"type":"rtp","t_ms":2260,"data":"gGAAFAAAC8cRIjNEQQ8="}
+{"type":"rst","t_ms":61000}
+{"type":"conn","index":1}
+{"type":"rtsp_s2c","t_ms":62000,"data":"RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: OPTIONS,DESCRIBE,SETUP,PLAY,PAUSE,TEARDOWN\r\n\r\n"}
+{"type":"rtsp_s2c","t_ms":62001,"data":"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Base: rtsp://192.168.1.1/test.264/\r\nContent-Type: application/sdp\r\nServer: sunshine/1.11\r\nContent-Length: 365\r\n\r\nv=0\r\no=-2209971456 2209971456 IN IP4 192.168.1.1\r\ns=Unnamed\r\nc=IN IP4 192.168.1.11\r\nt=0 0\r\na=recvonly\r\nm=video 5004 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=640029;sprop-parameter-sets=AAAAAWdNADKWNUBQAWtNwEBAQIA=,AAAAAWjuMbI=;\r\na=control:trackID=0\r\na=x-dimensions:2560,1440\r\na=SViewWifi:01234567890123456789012345678901\r\n"}
+{"type":"rtsp_s2c","t_ms":62002,"data":"RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: fixture-session;timeout=60\r\nTransport: RTP/AVP;unicast;client_port=20000-20001;destination=192.168.245.65;source=192.168.245.96;server_port=0-0\r\n\r\n"}
+{"type":"rtsp_s2c","t_ms":62003,"data":"RTSP/1.0 200 OK\r\nCSeq: 4\r\nSession: fixture-session\r\nRange: npt=0-\r\n\r\n"}
+{"type":"rtp","t_ms":62500,"data":"gGAAAQAAA+gRIjNEZQo="}
+{"type":"rtp","t_ms":62540,"data":"gGAAAgAAB9ARIjNEfIURIg=="}
+{"type":"rtp","t_ms":62580,"data":"gGAAAwAAB9ARIjNEfAUzRA=="}
+{"type":"rtp","t_ms":62620,"data":"gGAABAAAB9ARIjNEfEVV"}
+{"type":"rtp","t_ms":62660,"data":"gGAABQAAC7gRIjNEQQA="}
+{"type":"rtp","t_ms":62700,"data":"gGAABgAAC7kRIjNEQQE="}
+{"type":"rtp","t_ms":62740,"data":"gGAABwAAC7oRIjNEQQI="}
+{"type":"rtp","t_ms":62780,"data":"gGAADAAAD6ARIjNEQRA="}
+{"type":"rtp","t_ms":62820,"data":"gGAADQAAD6ERIjNEQRE="}
+{"type":"rtp","t_ms":62860,"data":"gGAADgAAD6IRIjNEQRI="}
+{"type":"rtp","t_ms":62900,"data":"gGAADwAAD6MRIjNEQRM="}
+{"type":"rtp","t_ms":62940,"data":"gGAAEAAAD6QRIjNEQRQ="}
+{"type":"rtp","t_ms":62980,"data":"gGAAEQAAD6URIjNEQRU="}
+{"type":"rtp","t_ms":63020,"data":"gGAAEgAAD6YRIjNEQRY="}
+{"type":"rtp","t_ms":63060,"data":"gGAAEwAAD6cRIjNEQRc="}
+{"type":"rtp","t_ms":63100,"data":"gGAAFAAAD6gRIjNEQRg="}
+{"type":"rst","t_ms":122000}
+{"type":"conn","index":2}
+{"type":"rtsp_s2c","t_ms":123000,"data":"RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: OPTIONS,DESCRIBE,SETUP,PLAY,PAUSE,TEARDOWN\r\n\r\n"}
+{"type":"rtsp_s2c","t_ms":123001,"data":"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Base: rtsp://192.168.1.1/test.264/\r\nContent-Type: application/sdp\r\nServer: sunshine/1.11\r\nContent-Length: 365\r\n\r\nv=0\r\no=-2209971456 2209971456 IN IP4 192.168.1.1\r\ns=Unnamed\r\nc=IN IP4 192.168.1.11\r\nt=0 0\r\na=recvonly\r\nm=video 5004 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=640029;sprop-parameter-sets=AAAAAWdNADKWNUBQAWtNwEBAQIA=,AAAAAWjuMbI=;\r\na=control:trackID=0\r\na=x-dimensions:2560,1440\r\na=SViewWifi:01234567890123456789012345678901\r\n"}
+{"type":"rtsp_s2c","t_ms":123002,"data":"RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: fixture-session;timeout=60\r\nTransport: RTP/AVP;unicast;client_port=20000-20001;destination=192.168.245.65;source=192.168.245.96;server_port=0-0\r\n\r\n"}
+{"type":"rtsp_s2c","t_ms":123003,"data":"RTSP/1.0 200 OK\r\nCSeq: 4\r\nSession: fixture-session\r\nRange: npt=0-\r\n\r\n"}
+{"type":"rtp","t_ms":123500,"data":"gGAAAQAAE4gRIjNEQQA="}
+{"type":"rtp","t_ms":123540,"data":"gGAAAgAAE4kRIjNEQQE="}
+{"type":"rtp","t_ms":123580,"data":"gGAAAwAAE4oRIjNEQQI="}
+{"type":"rtp","t_ms":123620,"data":"gGAABAAAE4sRIjNEQQM="}
+{"type":"rtp","t_ms":123660,"data":"gGAABQAAE4wRIjNEQQQ="}
+{"type":"rtp","t_ms":123700,"data":"gGAABgAAE40RIjNEQQU="}
+{"type":"rtp","t_ms":123740,"data":"gGAABwAAE44RIjNEQQY="}
+{"type":"rtp","t_ms":123780,"data":"gGAACAAAE48RIjNEQQc="}
+{"type":"rtp","t_ms":123820,"data":"gGAACQAAE5ARIjNEQQg="}
+{"type":"rtp","t_ms":123860,"data":"gGAACgAAE5ERIjNEQQk="}
+{"type":"end","t_ms":130000}
