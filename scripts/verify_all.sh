@@ -19,7 +19,7 @@ cargo test --workspace || fail "workspace tests" $?
 step "2/4 replay 重放合成 fixture（含宣告值檢查）"
 cargo run -q -p replay -- --input fixtures/sview-m0.jsonl || fail "replay" $?
 
-step "3/4 變異測試 harness（good 全綠＋5 個 mutant 全部由指定測試檢出）"
+step "3/4 變異測試 harness（good 全綠＋6 個 mutant 全部由指定測試檢出）"
 sh scripts/mutant_harness.sh || fail "mutant harness" $?
 
 step "4/4 工作樹狀態（harness 與測試必須是 tracked 內容）"

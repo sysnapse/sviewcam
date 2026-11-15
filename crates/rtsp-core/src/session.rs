@@ -546,8 +546,14 @@ pub async fn run(
         }
 
         on_event(Event::Rst { at_ms: now.saturating_sub(t0), reason: reason.clone(), class });
-        gap_open_at = Some(now);
-        gap_reason = reason;
+        // 已開著的空窗不覆寫（PM 2026-11-15 R8 裁定）：連續斷流期間相機一直沒送流，對外空窗是
+        // 連續的一段，不得因中間那次「PLAY 成功但零 RTP」的會話而把前段時間丟掉，否則相機反覆
+        // PLAY-不送流時，gaps 只報最後一次退避，看起來比實際健康。空窗由第一次 RST 開，
+        // 直到本會話首個 RTP 才收口（見上方 session_rtp == 0 分支）。
+        if gap_open_at.is_none() {
+            gap_open_at = Some(now);
+            gap_reason = reason;
+        }
         let _ = link.close().await;
 
         // 重連風暴上限：視窗內重連次數超過上限即停止並上報，不要 quietly 燒 CPU（§11.2）。
