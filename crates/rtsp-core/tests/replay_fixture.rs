@@ -75,6 +75,14 @@ async fn replays_fixture_and_matches_declared_expectations() {
         "最大空窗應為 1500 ms（±100），實測 {}",
         report.max_gap_ms
     );
+    // SVW-19（N3）：空窗「起點」也要自動斷言，不能只釘長度（長度對、起點錯照樣綠）。
+    // 兩次 RST 分別落在 61000／122000 ms（run 起點為 0）；若追蹤改成以 PLAY 或首包為起點，
+    // 或第二次 RST 覆寫了第一次的起點，這裡都會紅。
+    assert_eq!(
+        report.gaps.iter().map(|g| g.at_ms).collect::<Vec<_>>(),
+        vec![61_000, 122_000],
+        "空窗起點應為各次 RST 的時刻"
+    );
     assert_eq!(report.lost_packets, 4, "缺口應為 4 個封包");
     assert_eq!(report.seq_gaps[0].lost, 4);
     assert!(events > 0);

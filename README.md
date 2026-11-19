@@ -34,6 +34,11 @@ SVIEW_TOKEN=<32 位數字> cargo run -p probe -- \
 `probe` 結束會印 JSON 統計：`rtp_packets`、`rtp_bytes`、`seq_gaps`、`gaps`（重連空窗）、`reconnects`。
 沒有 RTP 時 exit code 1；權杖缺失時 exit 2（不會重試）。
 
+`reconnects` 的定義是「斷流後**成功續流**的重連次數」：本會話至少收到一個 RTP 才計入，
+與 `gaps` 的收口點（RST→本會話首個 RTP）是同一個事件。相機 PLAY 200 之後不送流的會話
+即使握手全綠也不算續流——它會落入 RST 三類分類（多半是即時拒絕）並計入 `disconnects`，
+而不是被誤記成「已重連成功」。
+
 ## 故障注入 harness（重連鑑別力）
 
 驗收標準 2 要求「故障注入 harness 能檢出錯誤重連實作」，這要靠變異測試證明，
