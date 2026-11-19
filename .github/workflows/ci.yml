@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 同一條分支連推時取消前一次，省 runner 時間。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test + replay + mutant harness
+    runs-on: ubuntu-latest
+    # 這組步驟正常 40 秒內跑完，20 分鐘是卡死時的上限（預設 360 分鐘）。
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # 快取 cargo registry 與 target；key 綁版控內的 Cargo.lock。
+      # lock 只需 commit 進 repo，hashFiles 才算得出東西；否則這兩個 key 都會退化成固定字串，
+      # 變成任何分支共用一份永不更新的 cache。lock 換了 key 就跟著換，舊 key 由 restore-keys 撿回來暖機。
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # 驗收標準 1：workspace 全測試（目前 29 passed / 0 failed）。
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # 驗收標準 2：fixture 重放要走同一條重連狀態機，且宣告值全部符合。
+      # 這裡的 grep 只證明 replay 真的跑完、印出成功字樣（--check 開著時才會印）；
+      # 它擋不到「fixture 沒宣告 expected 就無從比對」的情況——那種 fixture 照樣印同一句話且 rc=0。
+      # 缺值的洞由第 1 步擋：crates/rtsp-core/tests/replay_fixture.rs 對 meta.expected_* 用 .unwrap()，
+      # fixture 少了 expected_* 會先 panic，cargo test 就紅。
+      - name: replay fixture
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo run -p replay -- \
+            --input fixtures/sview-m0.jsonl \
+            --report /tmp/report.json \
+            --annexb /tmp/session.h264 | tee /tmp/replay.log
+          grep -q 'fixture 期望全部符合' /tmp/replay.log
+
+      # 驗收標準 2：變異測試 harness 證明重連測試有鑑別力（good 全綠 + 6 個 mutant 全檢出）。
+      - name: mutant harness
+        run: sh scripts/mutant_harness.sh
