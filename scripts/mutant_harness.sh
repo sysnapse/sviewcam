@@ -68,7 +68,7 @@ anchor_check() {
             N=$(grep -c '^        clock\.sleep(delay)\.await;$' "$BAK" || true)
             [ "$N" = 1 ] || { echo "錨點失效：$1 的 sleep(delay) 有 $N 處（應為 1）"; exit 4; } ;;
         mutantB)
-            N=$(grep -cF '} else if d > 1 && d < 0x4000 {' "$BAK" || true)
+            N=$(grep -cF '} else if d > 1 && d < 0x4001 {' "$BAK" || true)
             [ "$N" = 1 ] || { echo "錨點失效：mutantB 的缺口窗口有 $N 處（應為 1）"; exit 4; } ;;
         mutantC)
             N=$(grep -c '^            RstClass::TimedRecycle$' "$BAK" || true)
@@ -100,7 +100,7 @@ inject() {
         mutantB)
             # 不容忍向後跳：把「向前缺口」的窗口條件改成「只要不連號就算缺口」。
             # 正確實作對 d>=0xC000（向後）只記 out_of_order；此變異會把它記成丟包與缺口。
-            subline "$BAK" '} else if d > 1 && d < 0x4000 {' '} else if d != 1 {' > "$SRC"
+            subline "$BAK" '} else if d > 1 && d < 0x4001 {' '} else if d != 1 {' > "$SRC"
             N=$(grep -c "} else if d != 1 {" "$SRC" || true)
             [ "$N" = 1 ] || { echo "注入失敗：mutantB（$N 處，應為 1）"; exit 4; }
             ;;
