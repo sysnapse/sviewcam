@@ -32,9 +32,8 @@ fn config() -> SessionConfig {
     );
     cfg.duration = Some(Duration::from_secs(7200));
     cfg.heartbeat = None;
-    // recv_timeout 走真實 tokio 計時器（VirtualClock 只管 now_ms），故用毫秒級；
-    // 下面的 hang 連線會永遠 pending，等這個 timeout 觸發。
-    cfg.recv_timeout = Duration::from_millis(20);
+    // recv_timeout 由各測試自行指定：只有「握手全綠但零 RTP」那條會用到它，
+    // 且刻意用已到期的 deadline（見該測試），不依賴 wall-clock（N2）。
     cfg
 }
 
@@ -127,9 +126,17 @@ async fn play_ok_without_any_rtp_records_no_gap_and_no_reconnected() {
     let clock = Arc::new(VirtualClock::new());
     let factory = MockFactory::new(plans);
 
+    // N2：不再用 20 ms 真實計時器等 hang 連線逾時（高負載 CI 會 flake）。
+    // `Duration::ZERO` 令 `tokio::time::timeout` 的 deadline 在第一次 poll 時就已到：
+    // 內層 `recv_rtp`（hang）pending → 立刻回 Elapsed，仍走 session 的「靜默逾時」分支
+    // （disconnect_reason = "no rtp for 0 ms"），但完全不註冊 wall-clock 等待。
+    // 本測試要釘的是「零 RTP 不得算續流」的不變式，不是靜默了多久；時間語義由 VirtualClock 管。
+    let mut cfg = config();
+    cfg.recv_timeout = Duration::ZERO;
+
     let mut sink = VecSink::new();
     let mut log: Vec<String> = Vec::new();
-    let report = run(&factory, &config(), &clock, &mut sink, &mut |e| {
+    let report = run(&factory, &cfg, &clock, &mut sink, &mut |e| {
         log.push(match e {
             Event::Reconnected { gap_ms, .. } => format!("reconnected:{gap_ms}"),
             Event::Rst { reason, .. } => format!("rst:{reason}"),
@@ -154,6 +161,14 @@ async fn play_ok_without_any_rtp_records_no_gap_and_no_reconnected() {
     assert_eq!(
         report.rst_immediate_reject, report.connects,
         "零 RTP 的中斷都應歸入即時拒絕：{:?}",
+        report.finished
+    );
+    // SVW-19（N1）：reconnects 只計「成功續流」的重連（本會話至少收到一個 RTP）。
+    // 這裡 5 段連線全部握手成功、零 RTP，故一次續流都沒有；舊語義（握手成功即計）
+    // 會得到 connects-1 = 4，把「相機 PLAY 後不送流」誤記成已重連成功。
+    assert_eq!(
+        report.reconnects, 0,
+        "零 RTP 的會話不得計為成功重連：{:?}",
         report.finished
     );
 }

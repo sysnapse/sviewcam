@@ -138,7 +138,9 @@ pub struct Report {
     pub duration_ms: u64,
     /// TCP 連線並完成 OPTIONS→PLAY 的次數。
     pub connects: u32,
-    /// `connects - 1`：斷流後成功續流的次數。
+    /// 斷流後**成功續流**的重連次數：本會話至少收到一個 RTP 才算。
+    /// 握手成功但零 RTP 的會話（相機 PLAY 後不送流）不算續流，計入 `rst_*` 分類與 `disconnects`。
+    /// 舊語義為 `connects - 1`（握手成功即計），SVW-19 起改為與空窗收口同一事件。
     pub reconnects: u32,
     pub connect_failures: u32,
     /// 觀察到的斷流次數（RST／靜默）。
@@ -338,9 +340,12 @@ pub async fn run(
         };
 
         rep.connects += 1;
-        if rep.connects > 1 {
-            rep.reconnects += 1;
-        }
+        // SVW-19（N1）：reconnects 的語義是「斷流後**成功續流**的重連」，不是「握手成功」。
+        // 相機會在 PLAY 200 之後直接 RST、或乾脆不送流；若在握手成功時就遞增，這些從未收到
+        // 任何 RTP 的會話會被誤記成已重連成功（零 RTP 情境實測 5 段連線得 reconnects=4）。
+        // 故延後到下方 `session_rtp == 0`「本會話首個 RTP」分支才遞增——與空窗收口點同一事件，
+        // 兩者對「續流成功」的定義才不會分歧。session_is_reconnect 記住這段是不是重連會話。
+        let session_is_reconnect = rep.connects > 1;
         if rep.sprop_sets == 0 {
             rep.sprop_sets = info.sprop.len();
         }
@@ -394,6 +399,11 @@ pub async fn run(
                                 // 只有 PLAY 成功不算——即時拒絕的會話同樣會 PLAY 成功然後 <10 s 被 RST。
                                 immediate_streak = 0;
                                 midstream_backoff = cfg.reconnect.midstream_initial;
+                                // SVW-19（N1）：reconnects 也在這裡遞增，與空窗收口同一事件；
+                                // 握手成功但零 RTP 的會話不計入「成功續流」。
+                                if session_is_reconnect {
+                                    rep.reconnects += 1;
+                                }
                                 // N1：空窗收口點＝本會話首個 RTP 到達時（R1 語義）。量到的 ms 是
                                 // 「RST→首個 RTP」；PLAY 成功但永不送 RTP 的會話不會走到這裡，
                                 // 故其空窗不記錄、不發 Reconnected，改由 recv_timeout 分類計入失敗。
