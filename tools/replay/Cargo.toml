@@ -18,3 +18,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]
 camcore = { path = "../../crates/camcore" }
+serde_json = "1"

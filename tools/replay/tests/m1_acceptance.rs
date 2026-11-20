@@ -171,8 +171,12 @@ fn ffprobe_available() -> bool {
         .unwrap_or(false)
 }
 
-/// 等到目錄裡至少有 `closed` 個已閉合段與至少一個未閉合段，然後 SIGKILL。
-fn kill_mid_write(dir: &Path) -> Vec<String> {
+/// 等到目錄裡有已閉合段與一個正在寫的 `.mkv.part`，然後 SIGKILL。
+///
+/// 這裡有本質上的競態：砍下去的那一瞬間寫入器可能正好在「上一個段 rename 完、
+/// 下一個段還沒開檔」的窗口，砍完目錄裡就沒有半寫段可復原（早期 CI 就是這樣
+/// 偶發紅的）。所以砍完要驗證 `.part` 真的還在，不在就換一個目錄重試。
+fn kill_once(dir: &Path) -> Vec<String> {
     let mut child = Command::new(bin())
         .arg("--input")
         .arg(fixture("ac3_kill"))
@@ -189,30 +193,44 @@ fn kill_mid_write(dir: &Path) -> Vec<String> {
             let _ = child.kill();
             panic!("等不到半寫的段檔（{deadline:?} 內）");
         }
-        let entries: Vec<String> = std::fs::read_dir(dir)
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let entries = list_dir(dir);
         let closed = entries.iter().filter(|n| n.ends_with(".mkv")).count();
         let parts = entries.iter().filter(|n| n.ends_with(".mkv.part")).count();
         if closed >= 2 && parts >= 1 {
-            // 再多寫一點，確保被砍的是「多半段」而非空檔
-            std::thread::sleep(Duration::from_millis(50));
             child.kill().expect("SIGKILL");
             let _ = child.wait();
-            return entries;
+            return list_dir(dir);
         }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
+/// 重試到「砍完當下還留著半寫段」為止，回傳 (資料目錄, 砍完的目錄內容)。
+fn kill_mid_write(tag: &str) -> (PathBuf, Vec<String>) {
+    for attempt in 0..8 {
+        let dir = data_dir(&format!("{tag}-{attempt}"));
+        let after = kill_once(&dir);
+        if after.iter().any(|n| n.ends_with(".mkv.part")) {
+            return (dir, after);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    panic!("連續 8 次都剛好在 rename 與開新段之間砍到，拿不到半寫段");
+}
+
+fn list_dir(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[test]
 fn ac3_kill_then_recover_leaves_only_playable_segments() {
-    let dir = data_dir("ac3");
-    let before = kill_mid_write(&dir);
+    let (dir, before) = kill_mid_write("ac3");
     assert!(
         before.iter().any(|n| n.ends_with(".mkv.part")),
         "SIGKILL 後應該留下未閉合段：{before:?}"
@@ -229,7 +247,15 @@ fn ac3_kill_then_recover_leaves_only_playable_segments() {
         .expect("執行 --recover-only");
     assert!(out.status.success(), "復原失敗：{}", stderr_of(&out));
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert!(stdout.contains("repaired") || stdout.contains("discarded"), "{stdout}");
+    // 解析 JSON 再判斷，不要用子字串：空陣列 `"repaired": []` 也含 "repaired"。
+    let report: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("復原報告不是 JSON（{e}）：{stdout}"));
+    let repaired = report["repaired"].as_array().map(|a| a.len()).unwrap_or(0);
+    let discarded = report["discarded"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(
+        repaired + discarded > 0,
+        "復原必須真的處理到半寫段（repaired+discarded == 0）：{stdout}"
+    );
 
     // 復原後目錄裡不該再有未閉合段
     let leftovers: Vec<String> = std::fs::read_dir(&dir)
