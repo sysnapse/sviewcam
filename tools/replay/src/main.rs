@@ -152,13 +152,17 @@ async fn real_main() -> std::process::ExitCode {
             Ok((writer, recovered)) => {
                 if !recovered.repaired.is_empty()
                     || !recovered.discarded.is_empty()
+                    || !recovered.adopted.is_empty()
+                    || !recovered.removed_orphans.is_empty()
                     || !recovered.pruned.is_empty()
                     || recovered.index_rebuilt
                 {
                     eprintln!(
-                        "復原掃描：修復 {}、丟棄 {}、清孤兒 {}、重建索引 {}",
+                        "復原掃描：修復 {}、丟棄 {}、收編孤兒 {}、刪孤兒檔 {}、清孤兒列 {}、重建索引 {}",
                         recovered.repaired.len(),
                         recovered.discarded.len(),
+                        recovered.adopted.len(),
+                        recovered.removed_orphans.len(),
                         recovered.pruned.len(),
                         recovered.index_rebuilt
                     );
@@ -289,6 +293,8 @@ fn recovery_json(report: &camcore::RecoveryReport) -> serde_json::Value {
     serde_json::json!({
         "repaired": report.repaired,
         "discarded": report.discarded,
+        "adopted": report.adopted,
+        "removed_orphans": report.removed_orphans,
         "pruned": report.pruned,
         "index_rebuilt": report.index_rebuilt,
         "rows": report.rows,
@@ -308,7 +314,7 @@ fn recording_json(writer: &RingWriter) -> camcore::Result<serde_json::Value> {
             "t_start_ms": t_start,
             "t_end_ms": t_end,
             "span_ms": t_end.saturating_sub(t_start),
-            "gap_segments": rows.iter().filter(|r| r.gap_ms > 0).count(),
+            "gap_segments": rows.iter().filter(|r| r.gap_ms.map_or(false, |g| g > 0)).count(),
             "event_count": events.len(),
             "events": events.iter().map(|e| serde_json::json!({
                 "at_ms": e.at_ms, "kind": e.kind, "detail": e.detail,

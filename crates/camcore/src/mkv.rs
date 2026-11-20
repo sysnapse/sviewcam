@@ -407,6 +407,12 @@ pub struct MkvInfo {
     pub last_complete_cluster_end: Option<u64>,
     /// 首個 keyframe SimpleBlock 元素的絕對位元組位移。
     pub first_keyframe_offset: Option<u64>,
+    /// 檔案裡**第一個** SimpleBlock 是否為 keyframe。
+    ///
+    /// 這是掃描器直接讀 flags 位元組得到的結論，和寫入器回報的 `idr_offset` 是兩條
+    /// 獨立路徑——用來證明「段的開頭真的能獨立解碼」，而不是拿寫入器自己的欄位
+    /// 循環自證。
+    pub first_block_keyframe: Option<bool>,
 }
 
 impl MkvInfo {
@@ -716,6 +722,9 @@ fn parse_cluster(bytes: &[u8], start: usize, end: usize, info: &mut MkvInfo) -> 
                 // 跳過 track vint（單軌固定 1 byte）
                 let rel = i16::from_be_bytes([bytes[p + 1], bytes[p + 2]]) as i64;
                 let flags = bytes[p + 3];
+                if info.first_block_keyframe.is_none() && info.blocks == 0 && blocks == 0 {
+                    info.first_block_keyframe = Some(flags & 0x80 != 0);
+                }
                 if flags & 0x80 != 0 {
                     keyframes += 1;
                     if info.first_keyframe_offset.is_none() {
@@ -861,6 +870,30 @@ mod tests {
         assert!(!info.is_closed());
         let _ = std::fs::remove_file(&part);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_reports_whether_first_block_is_keyframe() {
+        let key_path = tmp("first-key.mkv");
+        let mut w = MkvWriter::create(&key_path, &avc(), 640, 480, 0).unwrap();
+        w.append_block(&avcc_frame(&[0x65, 1, 2, 3]), 0, true).unwrap();
+        w.append_block(&avcc_frame(&[0x41, 4]), 40, false).unwrap();
+        w.finish().unwrap();
+        assert_eq!(scan(&key_path).unwrap().first_block_keyframe, Some(true));
+        let _ = std::fs::remove_file(&key_path);
+
+        // 首個 block 不是 IDR：掃描器必須自己從檔案判斷出來，不能沿用寫入器的欄位
+        let p_path = tmp("first-p.mkv");
+        let mut w = MkvWriter::create(&p_path, &avc(), 640, 480, 0).unwrap();
+        w.append_block(&avcc_frame(&[0x41, 1, 2, 3]), 0, false).unwrap();
+        w.append_block(&avcc_frame(&[0x65, 9]), 40, true).unwrap();
+        let sum = w.finish().unwrap();
+        let info = scan(&p_path).unwrap();
+        assert_eq!(info.first_block_keyframe, Some(false));
+        assert!(info.first_keyframe_offset.is_some(), "第二個 block 才是 keyframe");
+        assert_ne!(info.first_keyframe_offset, Some(0));
+        assert_eq!(sum.t_end, 40);
+        let _ = std::fs::remove_file(&p_path);
     }
 
     #[test]

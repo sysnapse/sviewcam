@@ -76,6 +76,14 @@ fn assert_segments_intact(dir: &Path, rows: &[camcore::SegmentRow]) {
             "{} 首個 keyframe 位移與索引不符",
             row.name
         );
+        // 段的開頭必須能獨立解碼：這條由掃描器直接讀檔案的 flags 位元組判定，
+        // 不看寫入器回報的 idr_offset（兩條獨立路徑，避免自證）
+        assert_eq!(
+            info.first_block_keyframe,
+            Some(true),
+            "{} 首個 SimpleBlock 不是 keyframe（掃描器從檔案判定）",
+            row.name
+        );
         assert!(row.t_end >= row.t_start);
     }
 }
@@ -101,7 +109,7 @@ fn ac1_retention_window_is_five_minutes() {
     let span = t_end - t_start;
     assert!(
         (300_000..=302_000).contains(&span),
-        "保留窗應落在 (300s, 302s]，實得 {span}ms"
+        "保留窗應落在 [300s, 302s]（閉區間，實作以「超過 window+segment 才修剪」保證），實得 {span}ms"
     );
     assert!(
         rows.len() <= 151,
@@ -300,7 +308,10 @@ fn ac4_reconnect_gap_recorded_and_segments_not_merged() {
     assert_segments_intact(&dir, &rows);
 
     // 有 gap 的段
-    let gap_rows: Vec<&camcore::SegmentRow> = rows.iter().filter(|r| r.gap_ms > 0).collect();
+    let gap_rows: Vec<&camcore::SegmentRow> = rows
+        .iter()
+        .filter(|r| r.gap_ms.map_or(false, |g| g > 0))
+        .collect();
     assert_eq!(
         gap_rows.len(),
         1,
@@ -308,22 +319,22 @@ fn ac4_reconnect_gap_recorded_and_segments_not_merged() {
         gap_rows.iter().map(|r| (r.name.clone(), r.gap_ms)).collect::<Vec<_>>()
     );
     let gap_row = gap_rows[0];
+    let gap_ms = gap_row.gap_ms.expect("gap 段的 gap_ms 必須有值");
     assert!(
-        (3_000..=5_000).contains(&gap_row.gap_ms),
-        "空窗約 3.5 秒，實得 {}ms",
-        gap_row.gap_ms
+        (3_000..=5_000).contains(&gap_ms),
+        "空窗約 3.5 秒，實得 {gap_ms}ms"
     );
 
     // gap 前後不得串成同一段：前一段必須在 gap 起點之前結束
     let idx = rows.iter().position(|r| r.segment_id == gap_row.segment_id).unwrap();
     assert!(idx > 0, "帶 gap 的段不該是索引第一段");
     let prev = &rows[idx - 1];
-    assert_eq!(prev.gap_ms, 0, "前一段不該也標 gap");
+    assert_eq!(prev.gap_ms, Some(0), "前一段不該也標 gap");
     assert!(
-        prev.t_end <= gap_row.t_start - gap_row.gap_ms,
+        prev.t_end <= gap_row.t_start - gap_ms,
         "前段 t_end={} 越過 gap 起點 {}",
         prev.t_end,
-        gap_row.t_start - gap_row.gap_ms
+        gap_row.t_start - gap_ms
     );
     assert!(
         gap_row.t_start > prev.t_end,
@@ -334,11 +345,18 @@ fn ac4_reconnect_gap_recorded_and_segments_not_merged() {
 
     // 帶 gap 的段必須從 keyframe 起（另一個檔，不承接前段 slice）
     let gap_info = mkv::scan(dir.join(&gap_row.name)).unwrap();
+    // ①掃描器自己讀檔案第一個 SimpleBlock 的 flags，判定是否 keyframe——
+    //   這條與寫入器的 idr_offset 無關，P 幀當首 block 時會直接紅。
     assert_eq!(
-        gap_info.first_keyframe_offset,
-        Some(gap_row.idr_offset),
-        "gap 段首個 block 必須是 IDR"
+        gap_info.first_block_keyframe,
+        Some(true),
+        "gap 段首個 SimpleBlock 不是 keyframe（掃描器從檔案 flags 判定）"
     );
+    // ②首個 keyframe 的位移就是段開頭（沒有更早的 P 幀）——刻意解析成 bool 再比，
+    //   避免與 idr_offset 同一個數字自我循環。
+    let starts_at_keyframe =
+        gap_info.first_keyframe_offset == Some(gap_row.idr_offset) && gap_info.blocks > 0;
+    assert!(starts_at_keyframe, "gap 段第一個 keyframe 必須落在索引記的位移上");
 
     // gap 事件要落地（不得只在記憶體裡）
     let events = index.events().unwrap();
@@ -349,6 +367,95 @@ fn ac4_reconnect_gap_recorded_and_segments_not_merged() {
 
     // 兩段的檔名時間軸與 gap 資訊一致
     assert!(camcore::recover::parse_t_start(&gap_row.name).is_some());
+}
+
+// ---------------------------------------------------------------- 復原：孤兒段檔收斂
+
+/// 複製一個段成「索引沒列」的檔，再跑復原掃描：必須被收編，磁碟與索引收斂。
+/// 順便丟一個壞檔進去，斷言它被刪掉且留事件。
+#[test]
+fn recover_adopts_or_removes_orphan_segments() {
+    let dir = data_dir("orphan");
+    let out = run(&dir, "ac4_gap", &["--retain-minutes", "15"]);
+    assert!(out.status.success(), "replay 失敗：{}", stderr_of(&out));
+    let before = rows_of(&dir);
+    assert!(before.len() >= 10, "需要數個段才能造孤兒，實得 {}", before.len());
+
+    // 造孤兒：複製一份已閉合段，檔名不在索引裡（模擬 rename 後、upsert 前被 kill）
+    let src = dir.join(&before[0].name);
+    let orphan_valid = dir.join("seg-000009999999.mkv");
+    std::fs::copy(&src, &orphan_valid).expect("複製孤兒段");
+    // 再造一個掃不過的孤兒檔
+    let orphan_junk = dir.join("seg-000008888888.mkv");
+    std::fs::write(&orphan_junk, b"not an mkv at all").expect("寫壞孤兒檔");
+
+    let out = Command::new(bin())
+        .arg("--input")
+        .arg(fixture("ac4_gap"))
+        .arg("--record-dir")
+        .arg(&dir)
+        .arg("--recover-only")
+        .output()
+        .expect("執行 --recover-only");
+    assert!(out.status.success(), "復原失敗：{}", stderr_of(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(stdout.contains("seg-000009999999"), "復原報告要列出收編的孤兒：{stdout}");
+
+    let after = rows_of(&dir);
+    assert!(
+        after.iter().any(|r| r.segment_id == "seg-000009999999"),
+        "孤兒段沒被收編進索引：rows={}",
+        after.len()
+    );
+    assert_eq!(after.len(), before.len() + 1, "只該多出被收編的那一段");
+    assert!(!orphan_junk.exists(), "掃不過的孤兒檔要刪掉");
+
+    // 事件不得靜默
+    let index = camcore::SegmentIndex::open(dir.join("index.sqlite")).unwrap();
+    let events = index.events().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "adopted" && e.detail.contains("seg-000009999999")),
+        "收編要留 adopted 事件：{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "removed_orphan" && e.detail.contains("seg-000008888888")),
+        "刪壞檔要留 removed_orphan 事件：{events:?}"
+    );
+
+    // 磁碟與索引收斂：目錄內段檔總量 == 索引總量
+    assert_eq!(
+        on_disk_segment_bytes(&dir),
+        index.total_bytes().unwrap(),
+        "復原後目錄段檔總量必須等於索引總量"
+    );
+
+    // 再跑一次要幂等（不會重複收編、不會多事件）
+    let out = Command::new(bin())
+        .arg("--input")
+        .arg(fixture("ac4_gap"))
+        .arg("--record-dir")
+        .arg(&dir)
+        .arg("--recover-only")
+        .output()
+        .expect("執行第二次 --recover-only");
+    assert!(out.status.success(), "第二次復原失敗：{}", stderr_of(&out));
+    assert_eq!(rows_of(&dir).len(), after.len(), "第二次復原不該改變段數");
+}
+
+fn on_disk_segment_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("seg-") {
+            total += entry.metadata().unwrap().len();
+        }
+    }
+    total
 }
 
 // ---------------------------------------------------------------- AC5

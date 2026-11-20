@@ -11,8 +11,12 @@
 //!    半截元素與預配置零尾巴，改名成 `.mkv`，寫成 `repaired` 段並留 event。
 //! 2. 連 header／軌道都不完整（連一個完整 Cluster 都沒有）→ 刪檔，留 `discarded`
 //!    event，絕不讓半截檔冒充可播放段。
-//! 3. 索引有段但檔案不見了 → 刪索引列並留 `pruned` event。
-//! 4. 索引完全缺失或為空 → 按檔名時序掃描所有 `.mkv` 重建索引，留 `index_rebuilt`
+//! 3. 磁碟上有 `.mkv` 但索引沒列（`close_segment` 先 rename 後 upsert，中間被砍就
+//!    會漏）→ 收編：掃描通過且已閉合就補進索引（`adopted`），掃不過就刪檔
+//!    （`removed_orphan`）。磁碟與索引必須收斂，否則 AC1 的「目錄總量==索引總量」
+//!    不變式會永久破一個洞。
+//! 4. 索引有段但檔案不見了 → 刪索引列並留 `pruned` event。
+//! 5. 索引完全缺失或為空 → 按檔名時序掃描所有 `.mkv` 重建索引，留 `index_rebuilt`
 //!    event。
 
 use std::fs;
@@ -30,6 +34,10 @@ pub struct RecoveryReport {
     pub repaired: Vec<String>,
     /// 被丟棄的未閉合段檔名。
     pub discarded: Vec<String>,
+    /// 被收編進索引的孤兒段檔（磁碟有、索引沒列）。
+    pub adopted: Vec<String>,
+    /// 被刪掉的孤兒段檔（磁碟有、索引沒列，且掃描不過）。
+    pub removed_orphans: Vec<String>,
     /// 被清掉的孤兒索引列。
     pub pruned: Vec<String>,
     /// 是否重建了索引。
@@ -86,16 +94,17 @@ pub fn recover(dir: &Path, index: &mut SegmentIndex) -> Result<RecoveryReport> {
                         fs::rename(&part_path, &final_path)?;
                         let t_start =
                             parse_t_start(&final_name).unwrap_or(info.t_start_ms);
+                        let segment_id = final_name.trim_end_matches(SEGMENT_EXT).to_string();
+                        // 索引若已有這一列的 gap_ms 就保留；沒有的話記「未知」，不猜 0
+                        let gap_ms = index.get(&segment_id)?.and_then(|r| r.gap_ms);
                         index.upsert(&SegmentRow {
-                            segment_id: final_name
-                                .trim_end_matches(SEGMENT_EXT)
-                                .to_string(),
+                            segment_id,
                             name: final_name.clone(),
                             t_start,
                             t_end: info.t_end_ms,
                             bytes: end,
                             idr_offset: info.first_keyframe_offset.unwrap_or(0),
-                            gap_ms: 0,
+                            gap_ms,
                             closed: true,
                             repaired: true,
                         })?;
@@ -109,33 +118,53 @@ pub fn recover(dir: &Path, index: &mut SegmentIndex) -> Result<RecoveryReport> {
                         )?;
                         report.repaired.push(final_name);
                     }
-                    _ => {
-                        let _ = fs::remove_file(&part_path);
-                        index.insert_event(
-                            info.t_end_ms,
-                            "discarded",
-                            &format!(
-                                "{final_name}：沒有完整 Cluster（{} bytes），整段丟棄",
-                                info.bytes
-                            ),
-                        )?;
-                        report.discarded.push(final_name);
-                    }
+                    _ => match fs::remove_file(&part_path) {
+                        Ok(()) => {
+                            index.insert_event(
+                                info.t_end_ms,
+                                "discarded",
+                                &format!(
+                                    "{final_name}：沒有完整 Cluster（{} bytes），整段丟棄",
+                                    info.bytes
+                                ),
+                            )?;
+                            report.discarded.push(final_name);
+                        }
+                        Err(e) => {
+                            // 刪不掉就不能宣稱丟棄，否則磁碟與索引都會停在半截狀態
+                            index.insert_event(
+                                info.t_end_ms,
+                                "discard_failed",
+                                &format!("{final_name}：整段丟棄失敗，檔案還在（{e}）"),
+                            )?;
+                        }
+                    },
                 }
             }
-            Err(e) => {
-                let _ = fs::remove_file(&part_path);
-                index.insert_event(
-                    0,
-                    "discarded",
-                    &format!("{final_name}：EBML 結構不完整（{e}），整段丟棄"),
-                )?;
-                report.discarded.push(final_name);
-            }
+            Err(e) => match fs::remove_file(&part_path) {
+                Ok(()) => {
+                    index.insert_event(
+                        0,
+                        "discarded",
+                        &format!("{final_name}：EBML 結構不完整（{e}），整段丟棄"),
+                    )?;
+                    report.discarded.push(final_name);
+                }
+                Err(e2) => {
+                    index.insert_event(
+                        0,
+                        "discard_failed",
+                        &format!("{final_name}：整段丟棄失敗，檔案還在（{e2}）"),
+                    )?;
+                }
+            },
         }
     }
 
-    // ---- 3. 索引孤兒 ----
+    // ---- 3. 磁碟孤兒（有檔無列）----
+    adopt_disk_orphans(dir, index, &mut report)?;
+
+    // ---- 4. 索引孤兒（有列無檔）----
     for row in index.rows()? {
         if !dir.join(&row.name).exists() {
             index.delete(&row.segment_id)?;
@@ -148,7 +177,7 @@ pub fn recover(dir: &Path, index: &mut SegmentIndex) -> Result<RecoveryReport> {
         }
     }
 
-    // ---- 4. 索引重建 ----
+    // ---- 5. 索引重建 ----
     if index.is_empty()? {
         let mut files = list_files(dir, SEGMENT_EXT);
         files.sort();
@@ -164,7 +193,7 @@ pub fn recover(dir: &Path, index: &mut SegmentIndex) -> Result<RecoveryReport> {
                         t_end: info.t_end_ms,
                         bytes: info.bytes,
                         idr_offset: info.first_keyframe_offset.unwrap_or(0),
-                        gap_ms: 0,
+                        gap_ms: None,
                         closed: info.is_closed(),
                         repaired: !info.is_closed(),
                     })?;
@@ -191,6 +220,77 @@ pub fn recover(dir: &Path, index: &mut SegmentIndex) -> Result<RecoveryReport> {
 
     report.rows = index.count()?;
     Ok(report)
+}
+
+/// 把「磁碟上有、索引沒列」的 `.mkv` 收斂掉：能掃成已閉合段就補進索引，
+/// 掃不過就刪檔。兩種結果都留 event，不得靜默。
+fn adopt_disk_orphans(
+    dir: &Path,
+    index: &mut SegmentIndex,
+    report: &mut RecoveryReport,
+) -> Result<()> {
+    let mut known: std::collections::HashSet<String> =
+        index.rows()?.into_iter().map(|r| r.segment_id).collect();
+    let mut files = list_files(dir, SEGMENT_EXT);
+    files.sort();
+    for file_name in files {
+        let segment_id = file_name.trim_end_matches(SEGMENT_EXT).to_string();
+        if known.contains(&segment_id) {
+            continue;
+        }
+        let path = dir.join(&file_name);
+        match mkv::scan(&path) {
+            Ok(info) if info.is_closed() => {
+                let t_start = parse_t_start(&file_name).unwrap_or(info.t_start_ms);
+                index.upsert(&SegmentRow {
+                    segment_id: segment_id.clone(),
+                    name: file_name.clone(),
+                    t_start,
+                    t_end: info.t_end_ms,
+                    bytes: info.bytes,
+                    idr_offset: info.first_keyframe_offset.unwrap_or(0),
+                    // 沒有記錄可查 → 空窗長度未知，不猜 0
+                    gap_ms: None,
+                    closed: true,
+                    repaired: false,
+                })?;
+                index.insert_event(
+                    info.t_end_ms,
+                    "adopted",
+                    &format!(
+                        "{file_name}：磁碟有段但索引沒列（上次 rename 後 crash），已按掃描結果收編（{} bytes）",
+                        info.bytes
+                    ),
+                )?;
+                report.adopted.push(file_name);
+                known.insert(segment_id);
+            }
+            scanned => {
+                let why = match &scanned {
+                    Ok(info) => format!("不是已閉合段（truncated={}）", info.truncated),
+                    Err(e) => format!("掃描失敗（{e}）"),
+                };
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        index.insert_event(
+                            0,
+                            "removed_orphan",
+                            &format!("{file_name}：磁碟有檔但索引沒列且{why}，已刪除"),
+                        )?;
+                        report.removed_orphans.push(file_name);
+                    }
+                    Err(e) => {
+                        index.insert_event(
+                            0,
+                            "orphan_remove_failed",
+                            &format!("{file_name}：孤兒檔刪不掉（{e}），索引仍與磁碟不符"),
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn list_files(dir: &Path, suffix: &str) -> Vec<String> {

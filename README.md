@@ -51,8 +51,8 @@ SVIEW_TOKEN=<32 位數字> cargo run -p probe -- \
 |---|---|
 | `camcore::ring` | 2 秒一段、GOP 對齊、4 秒強切、滿窗刪最舊、預配置 8 MiB |
 | `camcore::mkv` | 自寫 EBML/Matroska：unknown-size Segment、known-size Cluster、SimpleBlock、AVCC CodecPrivate；`scan()` 對截斷檔回報 `truncated` 與「最後一個完整 Cluster 結尾位移」 |
-| `camcore::index` | `segments`（`t_start`/`t_end`/`bytes`/`idr_offset`/`gap_ms`/`closed`/`repaired`）＋ `events`（gap、防呆補記、強切、復原動作） |
-| `camcore::recover` | 啟動掃描：`.mkv.part` 有完整 Cluster 就修復改名、否則丟棄並留事件；清孤兒列；索引缺失時按檔名時序重建 |
+| `camcore::index` | `segments`（`t_start`/`t_end`/`bytes`/`idr_offset`/`gap_ms`/`closed`/`repaired`）＋ `events`（gap、等 IDR、防呆補記、強切、復原動作）。`gap_ms` 可為 NULL：`Some(0)` 是確定連續、`None` 是復原時無從得知，不拿 0 冒充 |
+| `camcore::recover` | 啟動掃描雙向收斂：`.mkv.part` 有完整 Cluster 就修復改名、否則丟棄；磁碟有檔但索引沒列 → 收編（`adopted`）或刪檔（`removed_orphan`）；索引有列但檔案不在 → 清列（`pruned`）；索引缺失時按檔名時序重建 |
 
 ```sh
 cargo run -p replay -- --input fixtures/m1/ac1_six_min.jsonl \
@@ -62,7 +62,8 @@ cargo run -p replay -- --input fixtures/m1/ac1_six_min.jsonl \
 ```
 
 - **保留窗**：預設 5 分鐘，上限 15 分鐘（`HARD_MAX_WINDOW_MS`）。要求超過上限時夾住並**輸出一次**警告（`retention.clamped`），不靜默。
-- **重連 gap**：空窗收口時 `NalSink::gap()` 通知 ring——關閉當前段、下一段 `gap_ms > 0`、並強制從 IDR 起新段，gap 前後絕不串成同一段。
+- **重連 gap**：空窗收口時 `NalSink::gap()` 通知 ring——關閉當前段、下一段 `gap_ms > 0`，並**等到 IDR 才開段**（重連後先來 P 幀就繼續等，只記一則 `waiting_idr` 事件），gap 前後絕不串成同一段，段首一定可獨立解碼。
+- **段首 IDR**：`mkv::scan()` 直接讀檔案第一個 SimpleBlock 的 flags 判定 `first_block_keyframe`，驗收測試用它證明段首可獨立解碼，不靠寫入器自己的欄位。
 - **防呆補記**：相鄰 NAL 相隔超過 250 ms 卻沒收到 gap 事件時，仍關段並記 `implicit_gap` 事件（有記錄的補記，不是靜默）。
 - **合成串流**：fixture 的 `{"type":"synth_stream"}` 在重放時確定性合成 RTP（同一 fixture 每次位元組相同），走既有 `rtp::build` + FU-A 路徑，不需要把 GB 級 base64 塞進 JSONL。
 

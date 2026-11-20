@@ -25,8 +25,11 @@ pub struct SegmentRow {
     pub bytes: u64,
     /// 首個 keyframe block 的位元組位移。
     pub idr_offset: u64,
-    /// 本段開始前的重連／空窗長度（毫秒）；0 表示連續。
-    pub gap_ms: u64,
+    /// 本段開始前的重連／空窗長度（毫秒）。
+    ///
+    /// `Some(0)`＝確定連續；`Some(n)`＝已知 n ms 空窗；`None`＝**未知**（復原掃描
+    /// 收編的段沒有 gap 記錄，不猜 0，免得把斷流謊報成連續）。
+    pub gap_ms: Option<u64>,
     /// 是否已正常收段。
     pub closed: bool,
     /// 是否由啟動復原掃描修復。
@@ -52,7 +55,7 @@ CREATE TABLE IF NOT EXISTS segments (
     t_end       INTEGER NOT NULL,
     bytes       INTEGER NOT NULL,
     idr_offset  INTEGER NOT NULL,
-    gap_ms      INTEGER NOT NULL,
+    gap_ms      INTEGER,
     closed      INTEGER NOT NULL,
     repaired    INTEGER NOT NULL
 );
@@ -109,7 +112,7 @@ impl SegmentIndex {
                 row.t_end as i64,
                 row.bytes as i64,
                 row.idr_offset as i64,
-                row.gap_ms as i64,
+                row.gap_ms.map(|v| v as i64),
                 row.closed as i64,
                 row.repaired as i64,
             ],
@@ -132,13 +135,21 @@ impl SegmentIndex {
                     t_end: r.get::<_, i64>(3)? as u64,
                     bytes: r.get::<_, i64>(4)? as u64,
                     idr_offset: r.get::<_, i64>(5)? as u64,
-                    gap_ms: r.get::<_, i64>(6)? as u64,
+                    gap_ms: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
                     closed: r.get::<_, i64>(7)? != 0,
                     repaired: r.get::<_, i64>(8)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// 依 `segment_id` 取一筆。
+    pub fn get(&self, segment_id: &str) -> Result<Option<SegmentRow>> {
+        Ok(self
+            .rows()?
+            .into_iter()
+            .find(|r| r.segment_id == segment_id))
     }
 
     /// 段數。
@@ -239,7 +250,7 @@ mod tests {
             t_end,
             bytes: 1000,
             idr_offset: 200,
-            gap_ms: 0,
+            gap_ms: None,
             closed: true,
             repaired: false,
         }
@@ -258,10 +269,10 @@ mod tests {
         assert_eq!(idx.oldest().unwrap().unwrap().segment_id, "seg-000000000000");
         // upsert 覆蓋同一 id
         let mut r = row("seg-000000000000", 0, 2000);
-        r.gap_ms = 1500;
+        r.gap_ms = Some(1500);
         idx.upsert(&r).unwrap();
         assert_eq!(idx.count().unwrap(), 2);
-        assert_eq!(idx.rows().unwrap()[0].gap_ms, 1500);
+        assert_eq!(idx.rows().unwrap()[0].gap_ms, Some(1500));
         idx.delete("seg-000000000000").unwrap();
         assert_eq!(idx.count().unwrap(), 1);
     }
