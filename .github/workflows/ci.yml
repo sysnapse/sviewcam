@@ -5,6 +5,15 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # 為 AC3 的 ffprobe 釘版本：ubuntu-latest 每兩週滾一次 image，不釘的話「段壞了」與
+  # 「ffmpeg 換版導致 ffprobe 行為變了」在 log 裡長得一樣，分不出是哪一種。
+  # 更新方式：看 Install ffmpeg 步驟印出的 `ffprobe version …`，改這裡，並在同一個
+  # PR 說明「為什麼這次換版是安全的」（例如 CI log 裡 AC3 仍逐段 exit 0）。
+  # 比對只看主版本（`8.0.1`），不比 `-3ubuntu2` 這種 distro 修訂號：安全更新會動那段，
+  # 而 ffprobe 對 Matroska/h264 的行為不會因此改變，拿它當紅燈只會製造假警報。
+  EXPECTED_FFMPEG_VERSION: "8.0.1-3ubuntu2"
+
 # 同一條分支連推時取消前一次，省 runner 時間。
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -26,15 +35,22 @@ jobs:
       # ubuntu-latest 的 image **不含** ffmpeg（2024 之後已移除），要自己裝。
       # M1 AC3 用它證明復原後的段是真的可解碼的 h264，不是只有 EBML 結構對。
       #
-      # 為什麼不釘版本：runner image 每兩週滾一次，若把 `ffmpeg=8.0.1-3ubuntu2` 這種
-      # 帶 distro 修訂號的版本釘死在 apt 上，image 一升版就變成「找不到套件」——CI 紅的
-      # 原因會從「段的結構壞了」變成「apt 版本跑掉了」，反而蓋掉真正的訊號。折衷做法是
-      # 不釘、但把實際版本印進 log（下面的 ffprobe -version），出事時追得到當時跑哪版。
+      # 不在 apt 上釘 `ffmpeg=…`：image 一升版就會變成「找不到套件」，CI 紅的原因從
+      # 「段的結構壞了」變成「apt 版本跑掉了」。改成裝完之後**比對實際版本**與
+      # `env.EXPECTED_FFMPEG_VERSION`，不符就明確紅，訊息直接指出是版本漂移。
       - name: Install ffmpeg
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           ffprobe -version | head -1
+          INSTALLED=$(ffprobe -version | head -1 | awk '{print $3}')
+          WANT="${EXPECTED_FFMPEG_VERSION%%-*}"
+          GOT="${INSTALLED%%-*}"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::ffmpeg 版本漂移：預期 $WANT（env.EXPECTED_FFMPEG_VERSION=$EXPECTED_FFMPEG_VERSION）、實際 $GOT（$INSTALLED）。先確認這是 runner image 升版、AC3 的 ffprobe 仍逐段 exit 0，再更新 ci.yml 的 EXPECTED_FFMPEG_VERSION。"
+            exit 1
+          fi
+          echo "ffmpeg 版本符合預期：$INSTALLED（比對主版本 $WANT）"
 
       # 快取 cargo registry 與 target；key 綁版控內的 Cargo.lock。
       # lock 只需 commit 進 repo，hashFiles 才算得出東西；否則這兩個 key 都會退化成固定字串，
@@ -78,6 +94,6 @@ jobs:
             --annexb /tmp/session.h264 | tee /tmp/replay.log
           grep -q 'fixture 期望全部符合' /tmp/replay.log
 
-      # 驗收標準 2：變異測試 harness 證明重連測試有鑑別力（good 全綠 + 6 個 mutant 全檢出）。
+      # 驗收標準 2：變異測試 harness 證明重連測試有鑑別力（good 全綠 + 7 個 mutant 全檢出）。
       - name: mutant harness
         run: sh scripts/mutant_harness.sh

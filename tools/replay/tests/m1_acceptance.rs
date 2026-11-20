@@ -328,6 +328,198 @@ fn ac3_kill_then_recover_leaves_only_playable_segments() {
     }
 }
 
+/// 半寫段復原的**端到端**覆蓋（不只 `mkv.rs` 的單元測試）：
+///
+/// 1. `repaired` 路徑：用產品自己的 [`camcore::MkvWriter`] 造一個**多 Cluster** 的段檔
+///    （Block 橫跨 40 秒 → 兩個 Cluster），再**確定性地**截在最後一個 SimpleBlock 中間，
+///    做成 `seg-…mkv.part`。走產品路徑 `replay --recover-only`，驗證掃描器把檔案截到
+///    「最後一個完整 Cluster 的結尾」、修好的段可被 ffprobe 解、索引 `repaired=true`。
+/// 2. `discarded` 路徑：再放一個連 EBML header 都不完整的 `.part`，第二次復原要
+///    記 `discarded` 且**檔案真的被刪**（不是只寫事件）。
+///
+/// 兩份造檔**分批**跑（先 repaired 驗完，再放 discarded），避免同一輪復原裡兩者互相
+/// 影響檔名／事件順序。
+#[test]
+fn ac3_recover_repairs_midblock_and_discards_unrecoverable() {
+    let dir = data_dir("ac3-parts");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // ---- 造素材：兩個 Cluster，第二個 Cluster 最後一個 Block 之後再截 3 bytes。
+    // SPS/PPS 與 fixtures/m1 的 synth 串流同一組，解碼器認得。
+    const SPS: [u8; 16] = [
+        0x67, 0x4D, 0x00, 0x32, 0x96, 0x35, 0x40, 0x50, 0x01, 0x6B, 0x4D, 0xC0, 0x40, 0x40, 0x40,
+        0x80,
+    ];
+    const PPS: [u8; 4] = [0x68, 0xEE, 0x31, 0xB2];
+    let avc = camcore::AvcConfig::from_annexb(&SPS, &PPS);
+    let src = dir.join("seg-000000000000.mkv");
+    {
+        let mut w = camcore::MkvWriter::create(&src, &avc, 2560, 1440, 1 << 20).unwrap();
+        // IDR（type 5）開頭，之後每 40 ms 一個 P（type 1），一路到 40_000 ms：
+        // CLUSTER_MAX_MS 是 30 s，所以第 30 秒換 Cluster，檔案會有兩個 Cluster。
+        for i in 0..1001u64 {
+            let at = i * 40;
+            let keyframe = i == 0;
+            let nal: Vec<u8> = if keyframe {
+                let mut v = vec![0x65];
+                v.extend_from_slice(&[0x88; 24]);
+                v
+            } else {
+                let mut v = vec![0x41];
+                v.extend_from_slice(&[0x11; 24]);
+                v
+            };
+            w.append_block(&camcore::mkv::avcc_frame(&nal), at, keyframe)
+                .unwrap();
+        }
+        let summary = w.finish().unwrap();
+        assert!(
+            summary.bytes > 0 && summary.blocks == 1001,
+            "素材段要有 1001 個 block：{summary:?}"
+        );
+    }
+    let full = std::fs::read(&src).unwrap();
+    let full_info = mkv::scan(&src).unwrap();
+    assert!(
+        full_info.clusters >= 2,
+        "素材必須有兩個以上 Cluster 才有「前面的完整 Cluster」可留：{full_info:?}"
+    );
+
+    // 尾巴砍 3 bytes 一定落在最後一個元素（最後一個 SimpleBlock）裡。
+    let cut_at = full.len() - 3;
+    let truncated = &full[..cut_at];
+    let info = mkv::scan_bytes(truncated).unwrap();
+    let complete_end = info
+        .last_complete_cluster_end
+        .expect("截斷檔應該留得下至少一個完整 Cluster");
+    assert!(info.truncated, "截在 block 中間必須被標成 truncated");
+    assert!(
+        !info.is_closed(),
+        "截斷檔不該被當成已閉合段（is_closed 應為 false）"
+    );
+    assert!(
+        complete_end < cut_at as u64,
+        "完整 Cluster 結尾 {complete_end} 必須早於截斷點 {cut_at}（證明真的砍在元素中間）"
+    );
+    assert_eq!(info.clusters, 1, "截斷後只該剩一個完整 Cluster");
+
+    // 素材本身不是「半寫段」：移除它，只留 .part，讓復原只能從半寫段救回來。
+    std::fs::remove_file(&src).unwrap();
+    let part = dir.join("seg-000000000000.mkv.part");
+    std::fs::write(&part, truncated).unwrap();
+
+    // ---- 第 1 批：repaired
+    let report = recover_only(&dir);
+    let repaired = string_array(&report, "repaired");
+    assert!(
+        repaired.iter().any(|n| n == "seg-000000000000.mkv"),
+        "半寫段沒被修復：{report}"
+    );
+    assert!(!part.exists(), "修好的 .part 應該已被改名，不該留下");
+    let meta = std::fs::metadata(&src).expect("修復後應有段檔");
+    assert_eq!(
+        meta.len(),
+        complete_end,
+        "修復長度必須等於「最後一個完整 Cluster 的結尾」"
+    );
+    let fixed_info = mkv::scan(&src).unwrap();
+    assert!(fixed_info.is_closed(), "修復後的段必須是已閉合段：{fixed_info:?}");
+
+    let index = camcore::SegmentIndex::open(dir.join("index.sqlite")).unwrap();
+    let fixed_row = index
+        .get("seg-000000000000")
+        .unwrap()
+        .expect("修復後索引要有這一段");
+    assert!(fixed_row.repaired, "修復段在索引裡要標 repaired=true");
+    assert!(fixed_row.closed);
+    assert!(
+        index
+            .events()
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "repaired" && e.detail.contains("seg-000000000000")),
+        "修復動作要留 repaired 事件"
+    );
+    if ffprobe_available() {
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_streams", "-of", "json"])
+            .arg(&src)
+            .output()
+            .expect("執行 ffprobe");
+        assert!(
+            probe.status.success(),
+            "修復後的段 ffprobe 失敗：{}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        println!(
+            "ffprobe（修復段）→ {}",
+            String::from_utf8_lossy(&probe.stdout)
+        );
+    }
+
+    // ---- 第 2 批：discarded（連 EBML header 都不完整）
+    let bad = dir.join("seg-000008888888.mkv.part");
+    std::fs::write(&bad, b"not an ebml file").unwrap();
+    let before_rows = index.count().unwrap();
+    let report = recover_only(&dir);
+    let discarded = string_array(&report, "discarded");
+    assert!(
+        // 報告裡的檔名是「原本應該是」的段檔名（`.mkv`），不是 `.part`。
+        discarded.iter().any(|n| n.starts_with("seg-000008888888")),
+        "無法復原的半寫段應被記成 discarded：{report}"
+    );
+    assert!(!bad.exists(), "discarded 的 .part 必須真的被刪掉");
+    assert!(
+        !dir.join("seg-000008888888.mkv").exists(),
+        "discarded 不該留下任何 .mkv"
+    );
+    let index = camcore::SegmentIndex::open(dir.join("index.sqlite")).unwrap();
+    assert!(
+        index
+            .events()
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "discarded" && e.detail.contains("seg-000008888888")),
+        "丟棄動作要留 discarded 事件（不得靜默）"
+    );
+    assert_eq!(
+        index.count().unwrap(),
+        before_rows,
+        "丟棄不該動到既有段資料列"
+    );
+    assert!(
+        index.get("seg-000000000000").unwrap().is_some(),
+        "第一批判定的修復段不該被第二批影響"
+    );
+}
+
+/// 跑一次產品路徑的復原掃描，回傳解析後的報告 JSON。
+fn recover_only(dir: &Path) -> serde_json::Value {
+    let out = Command::new(bin())
+        .arg("--input")
+        .arg(fixture("ac3_kill"))
+        .arg("--record-dir")
+        .arg(dir)
+        .arg("--recover-only")
+        .output()
+        .expect("執行 --recover-only");
+    assert!(out.status.success(), "復原失敗：{}", stderr_of(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("復原報告不是 JSON（{e}）：{stdout}"))
+}
+
+fn string_array(report: &serde_json::Value, key: &str) -> Vec<String> {
+    report[key]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------- AC4
 
 #[test]

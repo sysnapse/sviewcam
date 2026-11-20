@@ -166,11 +166,16 @@ impl SegmentIndex {
 
     /// 收拾「上次升級做到一半」留下的 `segments_v1`。
     ///
-    /// 兩個可能的斷點，都靠筆數判斷要保留哪一份（資料只會多不會少）：
-    /// - `segments` 不存在或筆數比 `segments_v1` 少 → 半搬，丟掉半成品、把 `segments_v1` 還原回 `segments`，
-    ///   後續流程再跑一次升級。
-    /// - `segments` 筆數已不少於 `segments_v1` → 搬完了只是沒 DROP，直接刪掉殘留表。
+    /// 兩個可能的斷點（`ALTER RENAME` 後、`DROP` 前），一律**取聯集**而不是比筆數
+    /// 二選一：半搬時新表可能有舊表沒有的列，以舊表為準會把那些列整份丟掉（Verifier
+    /// 實測 `seg-000000200000` 消失）。資料只會多不會少，所以：
     ///
+    /// 1. 建 `segments_merged`（v2 形狀，`gap_ms` 可 NULL）；
+    /// 2. 先搬現有 `segments`（若存在），再 `INSERT OR IGNORE` `segments_v1`；
+    ///    同 `segment_id` 以 `segments` 那列為準（新表時間戳／`repaired` 較新）；
+    /// 3. 兩張舊表都 DROP，`segments_merged` 改名回 `segments`。
+    ///
+    /// `gap_ms` 全程保值：`None` 代表「未知」，不得 `COALESCE` 成 0（那是「確定連續」）。
     /// 回傳要寫進 `schema_repair` 事件的說明（沒有殘留就是 `None`）。
     fn repair_leftover_upgrade(conn: &Connection) -> Result<Option<String>> {
         if !Self::has_table(conn, "segments_v1")? {
@@ -183,21 +188,45 @@ impl SegmentIndex {
         } else {
             0
         };
-
-        if !has_segments || new_rows < old_rows {
-            if has_segments {
-                conn.execute_batch("DROP TABLE segments")?;
-            }
-            conn.execute_batch("ALTER TABLE segments_v1 RENAME TO segments")?;
-            Ok(Some(format!(
-                "上次 schema 升級在搬資料途中中斷：segments_v1 有 {old_rows} 筆、新表只有 {new_rows} 筆，已還原並重跑升級"
-            )))
+        let conflicts = if has_segments {
+            conn.query_row(
+                "SELECT COUNT(*) FROM segments s
+                 JOIN segments_v1 v ON s.segment_id = v.segment_id",
+                [],
+                |r| r.get(0),
+            )?
         } else {
-            conn.execute_batch("DROP TABLE segments_v1")?;
-            Ok(Some(format!(
-                "上次 schema 升級在 DROP 舊表前中斷：segments 已有 {new_rows} 筆（舊表 {old_rows} 筆），已刪掉殘留的 segments_v1"
-            )))
+            0
+        };
+
+        conn.execute_batch(SEGMENTS_MERGED_DDL)?;
+        if has_segments {
+            conn.execute_batch(
+                "INSERT INTO segments_merged
+                 SELECT segment_id, name, t_start, t_end, bytes, idr_offset, gap_ms, closed, repaired
+                 FROM segments",
+            )?;
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO segments_merged
+                 SELECT segment_id, name, t_start, t_end, bytes, idr_offset, gap_ms, closed, repaired
+                 FROM segments_v1",
+            )?;
+            conn.execute_batch("DROP TABLE segments")?;
+        } else {
+            // 只做到 ALTER RENAME 就中斷：新表根本還沒建，整份資料都在 segments_v1。
+            conn.execute_batch(
+                "INSERT INTO segments_merged
+                 SELECT segment_id, name, t_start, t_end, bytes, idr_offset, gap_ms, closed, repaired
+                 FROM segments_v1",
+            )?;
         }
+        conn.execute_batch("DROP TABLE segments_v1")?;
+        conn.execute_batch("ALTER TABLE segments_merged RENAME TO segments")?;
+
+        let total = Self::count_table(conn, "segments")?;
+        Ok(Some(format!(
+            "上次 schema 升級中途中斷：舊表 {old_rows} 筆、新表 {new_rows} 筆、同 id 衝突 {conflicts} 筆（取新表那列），聯集後 {total} 筆"
+        )))
     }
 
     fn count_table(conn: &Connection, table: &str) -> Result<i64> {
@@ -385,6 +414,21 @@ impl SegmentIndex {
         Ok(n as usize)
     }
 }
+
+/// 殘骸修復用的暫存表（v2 形狀）：先把兩邊的列聯集進來，再換掉舊表。
+const SEGMENTS_MERGED_DDL: &str = r#"
+CREATE TABLE segments_merged (
+    segment_id  TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    t_start     INTEGER NOT NULL,
+    t_end       INTEGER NOT NULL,
+    bytes       INTEGER NOT NULL,
+    idr_offset  INTEGER NOT NULL,
+    gap_ms      INTEGER,
+    closed      INTEGER NOT NULL,
+    repaired    INTEGER NOT NULL
+);
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -616,6 +660,114 @@ mod tests {
         let idx = SegmentIndex::open(&path).unwrap();
         assert_eq!(idx.count().unwrap(), 1, "半搬的結果要還原成舊表的完整資料");
         assert_eq!(idx.rows().unwrap()[0].gap_ms, Some(1500));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 殘骸修復不得只看筆數：半搬時新表獨有的列（舊表沒有）必須保住。
+    ///
+    /// 造「舊表 80 筆、新表 11 筆＝10 筆重疊＋1 筆獨有」的殘骸——筆數比較會判「舊表比較多、
+    /// 以舊表為準」，於是那 1 筆獨有的列整份消失（Verifier 實測 `seg-000000200000` 不見）。
+    /// 另外把一個重疊 id 在新表的值改掉，驗證同 id 取新表那列。
+    #[test]
+    fn repair_keeps_rows_unique_to_new_table() {
+        let path = temp_db("union");
+        let v1_schema = "CREATE TABLE segments (
+                 segment_id  TEXT PRIMARY KEY,
+                 name        TEXT NOT NULL,
+                 t_start     INTEGER NOT NULL,
+                 t_end       INTEGER NOT NULL,
+                 bytes       INTEGER NOT NULL,
+                 idr_offset  INTEGER NOT NULL,
+                 gap_ms      INTEGER NOT NULL,
+                 closed      INTEGER NOT NULL,
+                 repaired    INTEGER NOT NULL
+             );
+             CREATE INDEX segments_by_start ON segments(t_start);
+             CREATE TABLE events (
+                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                 at_ms   INTEGER NOT NULL,
+                 kind    TEXT NOT NULL,
+                 detail  TEXT NOT NULL
+             );";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(v1_schema).unwrap();
+            for i in 0..80u64 {
+                let t = i * 2000;
+                conn.execute(
+                    "INSERT INTO segments VALUES (?1, ?2, ?3, ?4, ?5, 200, 1500, 1, 0)",
+                    params![
+                        format!("seg-{t:012}"),
+                        format!("seg-{t:012}.mkv"),
+                        t as i64,
+                        (t + 2000) as i64,
+                        (1000 + i) as i64
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        {
+            // 半搬狀態：舊表改名、新表（v2 形狀）已寫入 10 筆重疊 + 1 筆獨有。
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("ALTER TABLE segments RENAME TO segments_v1;").unwrap();
+            conn.execute_batch(SEGMENTS_MERGED_DDL.replace("segments_merged", "segments").as_str())
+                .unwrap();
+            // 只有 10 筆重疊被搬進新表（模擬搬到一半就斷電）——比筆數的話這裡會判「舊表多」。
+            conn.execute_batch(
+                "INSERT INTO segments
+                 SELECT segment_id, name, t_start, t_end, bytes, idr_offset, gap_ms, closed, repaired
+                 FROM segments_v1 LIMIT 10",
+            )
+            .unwrap();
+            // 同 id 衝突：新表那列的時間比較新（模擬升級後又更新過）
+            conn.execute("UPDATE segments SET t_end = 9999 WHERE segment_id = 'seg-000000000000'", [])
+                .unwrap();
+            // 只有新表有的列，gap_ms 是 NULL（未知）——不得被丟掉，也不得被寫成 0
+            conn.execute(
+                "INSERT INTO segments VALUES ('seg-000000200000', 'seg-000000200000.mkv', 200000, 202000, 1500, 300, NULL, 1, 0)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+        }
+
+        let idx = SegmentIndex::open(&path).unwrap();
+        assert_eq!(
+            idx.count().unwrap(),
+            81,
+            "聯集後不得丟掉任何一邊獨有的列（舊表 80 筆 + 新表獨有 1 筆）"
+        );
+        let unique = idx.get("seg-000000200000").unwrap().expect("新表獨有的列不見了");
+        assert_eq!(unique.t_start, 200_000);
+        assert_eq!(unique.t_end, 202_000);
+        assert_eq!(unique.gap_ms, None, "未知的 gap 不得被寫成 0（那是「確定連續」）");
+        assert!(unique.closed);
+        assert!(!unique.repaired);
+
+        let conflicted = idx.get("seg-000000000000").unwrap().unwrap();
+        assert_eq!(conflicted.t_end, 9999, "同 id 衝突要取新表那列");
+
+        // 索引總 bytes 必須等於磁碟上實際段檔大小總和（造一個對應的資料目錄）
+        let dir = std::env::temp_dir().join(format!(
+            "sview-union-bytes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for row in idx.rows().unwrap() {
+            std::fs::write(dir.join(&row.name), vec![0u8; row.bytes as usize]).unwrap();
+        }
+        let on_disk: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
+        assert_eq!(on_disk, idx.total_bytes().unwrap(), "索引 bytes 與磁碟不符");
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::remove_file(&path).ok();
     }
 
