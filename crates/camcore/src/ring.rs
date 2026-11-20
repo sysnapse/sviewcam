@@ -389,6 +389,87 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 強切：段滿 `segment_ms` 卻一直沒有 IDR，超過 `force_cut_ms` 就切。
+    ///
+    /// 目前產品語義是 B（k23 只釘住邊界與 gap 值）：強切後**不**等 IDR，新段第一幀就是
+    /// 觸發強切的那個 P 幀，所以那一段不能獨立回放。行為變更（改成強切後也等 IDR）由
+    /// k24 另行處理，這裡刻意**不**斷言 `first_block_keyframe`，免得把缺陷寫成期望值。
+    #[test]
+    fn forced_cut_when_segment_overruns_without_idr() {
+        let dir = tmp_dir("forced-cut");
+        let (mut w, _report) = RingWriter::open(RingConfig::new(&dir)).unwrap();
+        w.nal_at(&SPS, 0);
+        w.nal_at(&PPS, 0);
+        w.nal_at(&IDR, 0);
+        // 每 100 ms 一個 P 幀（間隔 < IMPLICIT_GAP_MS=250，不會誤觸防呆），到 4000 ms
+        for t in (100..=4000).step_by(100) {
+            w.nal_at(&P, t);
+        }
+        assert!(w.take_error().is_none());
+        w.finish().unwrap();
+        assert!(w.take_error().is_none());
+
+        let rows = w.index().rows().unwrap();
+        assert_eq!(rows.len(), 2, "強切只該產生兩段：{rows:?}");
+        // 段滿 2000 ms 不切（沒有 IDR），要等到 force_cut_ms=4000 才切
+        assert_eq!(rows[0].t_start, 0, "{rows:?}");
+        assert_eq!(rows[0].t_end, 4000, "切點在強切那一刻，不是 segment_ms 滿的那一刻");
+        assert_eq!(rows[1].t_start, 4000, "新段從強切的那個 NAL 開始");
+        // 0＝已知沒有斷流（強切不是 gap），與 None＝未知不同；不要寫成 NULL。
+        assert_eq!(rows[1].gap_ms, Some(0), "強切不是斷流，不該記 gap");
+        assert_eq!(rows[0].gap_ms, Some(0));
+
+        let events = w.index().events().unwrap();
+        let forced: Vec<_> = events.iter().filter(|e| e.kind == "forced_cut").collect();
+        assert_eq!(forced.len(), 1, "強切要留且只留一筆事件：{events:?}");
+        assert!(forced[0].detail.contains("4000"), "事件要帶強切時間：{:?}", forced[0]);
+        assert!(
+            !events.iter().any(|e| e.kind == "implicit_gap"),
+            "間隔都在 250 ms 內，不該有 implicit_gap：{events:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 防呆：相鄰 NAL 間隔超過 250 ms 卻沒收到 gap 事件 → 補記並切段，
+    /// 切點落在前一個 NAL、補記的 gap 落到下一段的 `gap_ms`。
+    #[test]
+    fn implicit_gap_inside_segment_closes_at_previous_nal() {
+        let dir = tmp_dir("implicit-gap");
+        let (mut w, _report) = RingWriter::open(RingConfig::new(&dir)).unwrap();
+        w.nal_at(&SPS, 0);
+        w.nal_at(&PPS, 0);
+        w.nal_at(&IDR, 0);
+        w.nal_at(&P, 100);
+        // 300 ms 間隔但沒呼叫 sink.gap()：防呆要自己補記並切段
+        w.nal_at(&P, 400);
+        assert!(w.take_error().is_none());
+        // 續流先來 P 幀 → 不開段；等 IDR 才開，補記的 gap 進新段
+        w.nal_at(&P, 440);
+        w.nal_at(&IDR, 800);
+        w.finish().unwrap();
+        assert!(w.take_error().is_none());
+
+        let rows = w.index().rows().unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].t_start, 0);
+        assert_eq!(rows[0].t_end, 100, "切點在前一個 NAL，不是晚到的那個");
+        assert_eq!(rows[1].t_start, 800, "補記 gap 後仍要等到 IDR 才開段");
+        assert_eq!(rows[1].gap_ms, Some(300), "補記的 gap 要落到下一段的索引上");
+
+        let events = w.index().events().unwrap();
+        let implicit: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "implicit_gap")
+            .collect();
+        assert_eq!(implicit.len(), 1, "補記恰一筆：{events:?}");
+        assert!(implicit[0].detail.contains("300"), "{:?}", implicit[0]);
+        assert!(
+            events.iter().any(|e| e.kind == "gap" && e.detail.contains("300")),
+            "開新段時要把補記的 gap 寫進事件：{events:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 重連 gap：關段於空窗起點、下一段記 gap_ms、且一定等到 IDR 才開段。
     #[test]
     fn gap_closes_segment_and_waits_for_idr() {

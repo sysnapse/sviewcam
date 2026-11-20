@@ -16,11 +16,12 @@
 #   mutantC   不分類（把定時回收當成中途 RST，白等退避）→ 定時回收退避必為 0
 #   mutantD   空窗收口點退回 PLAY 200（N1 前的行為）→ 空窗量成 RST→PLAY 而非 RST→首個 RTP
 #   mutantE   每次 RST 都重開空窗（R8 前的行為，覆寫已開的空窗）→ 連續停機只量到最後一段
+#   mutantF   reconnects 遞增時機搬回握手（SVW-19 前的行為）→ 零 RTP 會話被記成已重連成功
 #
 # 只動 session.rs 一個檔案、一個缺陷一版，mutant 一律從 .bak 重建，結束還原並以 sha256 核對。
 # POSIX sh＋busybox 工具即可（devbox 的 rust 模板沒有 python3，也不得假設能裝套件）。
 #
-# 用法：  sh scripts/mutant_harness.sh              # good + 5 mutants
+# 用法：  sh scripts/mutant_harness.sh              # good + 6 mutants
 #         sh scripts/mutant_harness.sh naive        # 只跑指定 mutant
 # 結束碼：0 全部檢出；1 有 mutant 逃逸或 good 不綠；3 原始碼還原失敗；4 harness／注入／編譯錯誤。
 
@@ -79,6 +80,13 @@ anchor_check() {
         mutantE)
             N=$(grep -c '^        if gap_open_at.is_none() {$' "$BAK" || true)
             [ "$N" = 1 ] || { echo "錨點失效：mutantE 的「已開空窗不覆寫」有 $N 處（應為 1）"; exit 4; } ;;
+        mutantF)
+            # 遞增時機的兩個錨點：握手成功的 `let session_is_reconnect = …` 與首個 RTP 分支的
+            # `if session_is_reconnect {`（各自恰好一個）。
+            N=$(grep -c '^        let session_is_reconnect = rep\.connects > 1;$' "$BAK" || true)
+            [ "$N" = 1 ] || { echo "錨點失效：mutantF 的 session_is_reconnect 宣告有 $N 處（應為 1）"; exit 4; }
+            M=$(grep -c '^                                if session_is_reconnect {$' "$BAK" || true)
+            [ "$M" = 1 ] || { echo "錨點失效：mutantF 的「首個 RTP 才遞增」有 $M 處（應為 1）"; exit 4; } ;;
     esac
 }
 
@@ -126,6 +134,18 @@ inject() {
             N=$(grep -c 'gap_open_at.take()' "$SRC" || true)
             [ "$N" = 2 ] || { echo "注入失敗：mutantD 應有 2 處 take（PLAY 與首個 RTP），實得 $N"; exit 4; }
             ;;
+        mutantF)
+            # SVW-19 前的行為：握手成功就 `rep.reconnects += 1`，首個 RTP 分支不再遞增。
+            # 於是「PLAY 200 但永不送 RTP」的會話也被記成重連成功（零 RTP 情境 5 段連線得 4）。
+            ins='        if session_is_reconnect { rep.reconnects += 1; }'
+            awk -v ins="$ins" '
+                { if ($0 == "        let session_is_reconnect = rep.connects > 1;") { print; print ins; next }
+                  if ($0 == "                                if session_is_reconnect {") { print "                                if false {"; next }
+                  print }' "$BAK" > "$SRC"
+            N=$(grep -c '^        if session_is_reconnect { rep\.reconnects += 1; }$' "$SRC" || true)
+            [ "$N" = 1 ] || { echo "注入失敗：mutantF 握手處沒有遞增（$N 處，應為 1）"; exit 4; }
+            M=$(grep -c '^                                if false {$' "$SRC" || true)
+            [ "$M" = 1 ] || { echo "注入失敗：mutantF 首個 RTP 分支仍在遞增（$M 處，應為 1）"; exit 4; } ;;
         mutantE)
             # R8 前的行為：每次 RST 都 gap_open_at = Some(now)／gap_reason = reason，
             # 於是「RST → PLAY 成功但零 RTP → RST」的前段停機被覆寫掉，空窗只量最後一段。
@@ -151,6 +171,7 @@ require_of() {
         mutantC) echo 'timed_recycle_reconnects_immediately_with_zero_backoff' ;;
         mutantD) echo 'replays_fixture_and_matches_declared_expectations|gap_is_measured_from_rst_to_first_rtp' ;;
         mutantE) echo 'midstream_rst_doubles_when_reconnect_gets_no_rtp' ;;
+        mutantF) echo 'play_ok_without_any_rtp_records_no_gap_and_no_reconnected' ;;
         good)    echo '' ;;
     esac
 }
@@ -206,7 +227,7 @@ echo "repo: $(pwd)"
 cargo --version
 
 if [ "$TARGET" = all ]; then
-    for m in good naive mutantA mutantB mutantC mutantD mutantE; do
+    for m in good naive mutantA mutantB mutantC mutantD mutantE mutantF; do
         echo "-- $m"
         run_one "$m"
     done
@@ -224,5 +245,5 @@ echo "$HITS" | grep -q 'NOTGREEN' && RC=1
 echo "$HITS" | grep -qE 'escaped|wrongtest' && RC=1
 echo "$HITS" | grep -qE 'compile_error|noresult' && RC=4
 [ "$RC" = 0 ] || echo "結論：未達標（exit $RC）"
-[ "$RC" = 0 ] && echo "結論：baseline 全綠，6 個 mutant 全部由指定測試檢出"
+[ "$RC" = 0 ] && echo "結論：baseline 全綠，7 個 mutant 全部由指定測試檢出"
 exit "$RC"
