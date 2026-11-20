@@ -562,3 +562,48 @@ fn ac5_thirty_minutes_stays_under_disk_budget() {
     );
     assert!(rows.len() <= 451, "15 分鐘 / 2 秒最多 451 段，實得 {}", rows.len());
 }
+
+/// 索引版本比程式新時，`--recover-only` 要用同一條「錯誤：…」+ rc=2 收尾。
+///
+/// 一般錄影啟動早就是這樣；`--recover-only` 原本在 `open_index()` 裡 `expect`，
+/// 使用者看到的是 rc=101 加一串 panic trace，像是程式壞掉而不是「該升級程式」。
+#[test]
+fn recover_only_rejects_newer_index_version_without_panic() {
+    let dir = data_dir("newerversion");
+    let index_path = dir.join("index.sqlite");
+    // 先讓產品建立 v2 索引，再把版本改成未來版（模擬使用者降級執行舊程式）。
+    {
+        let _index = camcore::SegmentIndex::open(&index_path).expect("建立索引");
+    }
+    {
+        let conn = rusqlite::Connection::open(&index_path).expect("開啟索引檔");
+        conn.pragma_update(None, "user_version", 99i64).expect("改版本");
+    }
+
+    let out = Command::new(bin())
+        .arg("--input")
+        .arg(fixture("ac4_gap"))
+        .arg("--record-dir")
+        .arg(&dir)
+        .arg("--recover-only")
+        .output()
+        .expect("執行 --recover-only");
+    let stderr = stderr_of(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "索引版本較新要用 rc=2（不是 panic 的 101）：{stderr}"
+    );
+    assert!(
+        stderr.contains("錯誤："),
+        "要沿用一般啟動的錯誤格式：{stderr}"
+    );
+    assert!(
+        stderr.contains("比程式支援的 2 新"),
+        "錯誤訊息要說清楚版本問題：{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "--recover-only 不該 panic 帶 trace：{stderr}"
+    );
+}

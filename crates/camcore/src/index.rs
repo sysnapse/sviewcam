@@ -107,9 +107,11 @@ impl SegmentIndex {
 
     /// 把既有索引升級到 [`SCHEMA_VERSION`]。
     ///
-    /// 流程固定是「讀 `user_version` → 判斷要不要搬資料 → 建立缺少的表 → 寫回版本」，
-    /// 每多一版就多一個 `upgrade_N_to_M`，不做事後的臨時判斷。重複開啟是幂等的：
-    /// 版本已經是當前值就直接建表收工，`schema_upgrade` 事件只會寫一次。
+    /// 流程固定是「讀 `user_version` → 修掉上次沒做完的殘留 → 判斷要不要搬資料 →
+    /// 建立缺少的表 → 寫回版本」，每多一版就多一個 `upgrade_N_to_M`，不做事後的臨時判斷。
+    /// 整段在同一個 transaction 裡：升級本身就是為了救 crash 窗，不能自己再開一個新的
+    /// crash 窗（中途失敗一律 rollback，檔案回到升級前的樣子）。重複開啟幂等，
+    /// `schema_upgrade` 事件只寫一次。
     fn migrate(conn: &Connection) -> Result<()> {
         let version = Self::user_version(conn)?;
         if version > SCHEMA_VERSION {
@@ -118,16 +120,24 @@ impl SegmentIndex {
             )));
         }
 
-        // 沒有 user_version 的舊檔：靠欄位形狀認出 v1（gap_ms NOT NULL）。
-        let legacy_v1 = version < 2
-            && Self::has_table(conn, "segments")?
-            && Self::column_not_null(conn, "segments", "gap_ms")?;
+        let tx = conn.unchecked_transaction()?;
+
+        // 上次升級若在 ALTER RENAME 之後斷掉，資料會卡在 segments_v1。
+        let repaired_leftover = Self::repair_leftover_upgrade(&tx)?;
+
+        // 靠欄位形狀認出 v1（gap_ms NOT NULL）而不是只看 user_version：上面若把
+        // segments_v1 還原回來，表是 v1 形狀、版本號卻可能已經寫成 2，只看版本會漏升級。
+        let legacy_v1 = Self::has_table(&tx, "segments")?
+            && Self::column_not_null(&tx, "segments", "gap_ms")?;
 
         if legacy_v1 {
-            let kept = Self::upgrade_1_to_2(conn)?;
-            // 建表（events 可能也缺）後才能寫事件
-            conn.execute_batch(SCHEMA)?;
-            conn.execute(
+            let kept = Self::upgrade_1_to_2(&tx)?;
+            // 這裡的第二次建表是必要的，不是重複：搬資料時 `segments_by_start` 還掛在
+            // 改名後的舊表上，`CREATE INDEX IF NOT EXISTS` 會因撞名跳過，等舊表 DROP
+            // 掉索引就一起沒了；所以要等舊表消失後再建一次。少了這行，升級後查詢就
+            // 默默變成全表掃描而測試不會紅。
+            tx.execute_batch(SCHEMA)?;
+            tx.execute(
                 "INSERT INTO events (at_ms, kind, detail) VALUES (?1, ?2, ?3)",
                 params![
                     0i64,
@@ -136,13 +146,62 @@ impl SegmentIndex {
                 ],
             )?;
         } else {
-            conn.execute_batch(SCHEMA)?;
+            tx.execute_batch(SCHEMA)?;
+        }
+
+        if let Some(detail) = repaired_leftover {
+            tx.execute(
+                "INSERT INTO events (at_ms, kind, detail) VALUES (?1, ?2, ?3)",
+                params![0i64, "schema_repair", detail],
+            )?;
         }
 
         if version < SCHEMA_VERSION {
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+
+        tx.commit()?;
         Ok(())
+    }
+
+    /// 收拾「上次升級做到一半」留下的 `segments_v1`。
+    ///
+    /// 兩個可能的斷點，都靠筆數判斷要保留哪一份（資料只會多不會少）：
+    /// - `segments` 不存在或筆數比 `segments_v1` 少 → 半搬，丟掉半成品、把 `segments_v1` 還原回 `segments`，
+    ///   後續流程再跑一次升級。
+    /// - `segments` 筆數已不少於 `segments_v1` → 搬完了只是沒 DROP，直接刪掉殘留表。
+    ///
+    /// 回傳要寫進 `schema_repair` 事件的說明（沒有殘留就是 `None`）。
+    fn repair_leftover_upgrade(conn: &Connection) -> Result<Option<String>> {
+        if !Self::has_table(conn, "segments_v1")? {
+            return Ok(None);
+        }
+        let old_rows = Self::count_table(conn, "segments_v1")?;
+        let has_segments = Self::has_table(conn, "segments")?;
+        let new_rows = if has_segments {
+            Self::count_table(conn, "segments")?
+        } else {
+            0
+        };
+
+        if !has_segments || new_rows < old_rows {
+            if has_segments {
+                conn.execute_batch("DROP TABLE segments")?;
+            }
+            conn.execute_batch("ALTER TABLE segments_v1 RENAME TO segments")?;
+            Ok(Some(format!(
+                "上次 schema 升級在搬資料途中中斷：segments_v1 有 {old_rows} 筆、新表只有 {new_rows} 筆，已還原並重跑升級"
+            )))
+        } else {
+            conn.execute_batch("DROP TABLE segments_v1")?;
+            Ok(Some(format!(
+                "上次 schema 升級在 DROP 舊表前中斷：segments 已有 {new_rows} 筆（舊表 {old_rows} 筆），已刪掉殘留的 segments_v1"
+            )))
+        }
+    }
+
+    fn count_table(conn: &Connection, table: &str) -> Result<i64> {
+        Ok(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?)
     }
 
     fn user_version(conn: &Connection) -> Result<i64> {
@@ -382,6 +441,7 @@ mod tests {
                  closed      INTEGER NOT NULL,
                  repaired    INTEGER NOT NULL
              );
+             CREATE INDEX segments_by_start ON segments(t_start);
              CREATE TABLE events (
                  id      INTEGER PRIMARY KEY AUTOINCREMENT,
                  at_ms   INTEGER NOT NULL,
@@ -468,6 +528,116 @@ mod tests {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(idx.count_events("schema_upgrade").unwrap(), 0);
+    }
+
+    fn index_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn.prepare(&format!("PRAGMA index_list({table})")).unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows
+    }
+
+    #[test]
+    fn migrated_legacy_db_keeps_segments_by_start_index() {
+        let path = temp_db("idxkeep");
+        make_legacy_v1_db(&path);
+        let idx = SegmentIndex::open(&path).unwrap();
+        let names = index_names(&idx.conn, "segments");
+        assert!(
+            names.iter().any(|n| n == "segments_by_start"),
+            "升級後索引不能默默消失：{names:?}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 模擬「ALTER RENAME 之後斷掉」：只剩 segments_v1，user_version 卻已經寫成 2。
+    #[test]
+    fn repairs_interrupted_upgrade_after_rename() {
+        let path = temp_db("halfrename");
+        make_legacy_v1_db(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("ALTER TABLE segments RENAME TO segments_v1")
+                .unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+        }
+
+        let idx = SegmentIndex::open(&path).expect("殘留 segments_v1 要能自癒，不能 rows=0");
+        let rows = idx.rows().unwrap();
+        assert_eq!(rows.len(), 1, "資料不能卡在 segments_v1 被當成空的索引");
+        assert_eq!(rows[0].gap_ms, Some(1500), "gap_ms 不得靜默丟失");
+        assert!(!rows[0].repaired, "repaired 旗標不得靜默丟失");
+        assert_eq!(
+            idx.count_events("schema_repair").unwrap(),
+            1,
+            "自癒要留 schema_repair 事件"
+        );
+        let leftover: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='segments_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "成功後不得留下 segments_v1");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// 模擬「搬一半斷掉」：新表只有部分列，舊表才是完整的。
+    #[test]
+    fn repairs_half_copied_upgrade() {
+        let path = temp_db("halfcopy");
+        make_legacy_v1_db(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE segments RENAME TO segments_v1;
+                 CREATE TABLE segments (
+                     segment_id  TEXT PRIMARY KEY,
+                     name        TEXT NOT NULL,
+                     t_start     INTEGER NOT NULL,
+                     t_end       INTEGER NOT NULL,
+                     bytes       INTEGER NOT NULL,
+                     idr_offset  INTEGER NOT NULL,
+                     gap_ms      INTEGER,
+                     closed      INTEGER NOT NULL,
+                     repaired    INTEGER NOT NULL
+                 );
+                 INSERT INTO segments SELECT * FROM segments_v1 WHERE segment_id = 'nope';",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2i64).unwrap();
+        }
+
+        let idx = SegmentIndex::open(&path).unwrap();
+        assert_eq!(idx.count().unwrap(), 1, "半搬的結果要還原成舊表的完整資料");
+        assert_eq!(idx.rows().unwrap()[0].gap_ms, Some(1500));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rejects_newer_schema_version() {
+        let path = temp_db("newer");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            conn.pragma_update(None, "user_version", 99i64).unwrap();
+        }
+        let err = match SegmentIndex::open(&path) {
+            Ok(_) => panic!("版本比程式新必須拒絕開啟"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("比程式支援的 2 新"),
+            "錯誤訊息要說清楚：{msg}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

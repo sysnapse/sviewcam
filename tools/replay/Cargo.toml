@@ -19,3 +19,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 [dev-dependencies]
 camcore = { path = "../../crates/camcore" }
 serde_json = "1"
+# 測試要造出「索引版本比程式新」的檔案（改 PRAGMA user_version），所以直接開 SQLite。
+rusqlite = { version = "0.37", features = ["bundled"] }

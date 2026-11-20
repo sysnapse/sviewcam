@@ -245,20 +245,13 @@ fn adopt_disk_orphans(
                 // 檔名優先，但檔名亂標（複製檔案、手動改名）時會出現 t_end < t_start 的
                 // 反向區間；那就退回掃描到的實際時間，別讓索引帶著不可能的時間範圍。
                 let name_t = parse_t_start(&file_name);
-                let t_start = match name_t {
-                    Some(t) if t <= info.t_end_ms => t,
-                    Some(t) => {
-                        index.insert_event(
-                            info.t_end_ms,
-                            "adopted",
-                            &format!(
-                                "{file_name}：檔名時間 {t} 比段尾 {} 還晚，改用掃描時間 {}（檔名不可信）",
-                                info.t_end_ms, info.t_start_ms
-                            ),
-                        )?;
-                        info.t_start_ms
-                    }
-                    None => info.t_start_ms,
+                let (t_start, name_note) = match name_t {
+                    Some(t) if t <= info.t_end_ms => (t, String::new()),
+                    Some(t) => (
+                        info.t_start_ms,
+                        format!("；檔名時間 {t} 比段尾 {} 還晚，改用掃描時間（檔名不可信）", info.t_end_ms),
+                    ),
+                    None => (info.t_start_ms, String::new()),
                 };
                 index.upsert(&SegmentRow {
                     segment_id: segment_id.clone(),
@@ -276,7 +269,7 @@ fn adopt_disk_orphans(
                     info.t_end_ms,
                     "adopted",
                     &format!(
-                        "{file_name}：磁碟有段但索引沒列（上次 rename 後 crash），已按掃描結果收編（{} bytes）",
+                        "{file_name}：磁碟有段但索引沒列（上次 rename 後 crash），已按掃描結果收編（{} bytes）{name_note}",
                         info.bytes
                     ),
                 )?;

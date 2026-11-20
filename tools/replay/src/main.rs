@@ -108,7 +108,16 @@ async fn real_main() -> std::process::ExitCode {
             eprintln!("錯誤：--recover-only 需要 --record-dir");
             return std::process::ExitCode::from(2);
         };
-        match camcore::recover::recover(dir, &mut open_index(dir)) {
+        let mut index = match open_index(dir) {
+            Ok(index) => index,
+            Err(e) => {
+                // 與一般錄影啟動走同一條「錯誤：…」+ rc=2，不要在這裡 panic 帶 trace：
+                // 索引版本比程式新是使用者該處理的狀況，不是程式當掉。
+                eprintln!("錯誤：無法開啟索引 {}：{e}", dir.display());
+                return std::process::ExitCode::from(2);
+            }
+        };
+        match camcore::recover::recover(dir, &mut index) {
             Ok(report) => {
                 println!("{}", serde_json::to_string_pretty(&recovery_json(&report)).unwrap());
                 return std::process::ExitCode::SUCCESS;
@@ -284,9 +293,9 @@ async fn real_main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-fn open_index(dir: &std::path::Path) -> camcore::SegmentIndex {
+fn open_index(dir: &std::path::Path) -> camcore::Result<camcore::SegmentIndex> {
     let cfg = RingConfig::new(dir);
-    camcore::SegmentIndex::open(cfg.index_path()).expect("open index")
+    camcore::SegmentIndex::open(cfg.index_path())
 }
 
 fn recovery_json(report: &camcore::RecoveryReport) -> serde_json::Value {
