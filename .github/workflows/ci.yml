@@ -37,9 +37,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # 驗收標準 1：workspace 全測試（目前 29 passed / 0 failed）。
+      # 驗收標準 1：workspace 全測試（M0 29 個 + camcore 單元 + M1 AC1–AC4；AC5 標 ignored）。
       - name: cargo test --workspace
         run: cargo test --workspace
+
+      # M1 AC3：SIGKILL → 復原掃描，對每個閉合段跑真 ffprobe（ubuntu-latest 內建 ffmpeg）。
+      # 單獨再跑一次是為了 --nocapture：讓 ffprobe 的原始 JSON 進 CI log 當證據，
+      # 上面那步的 cargo test 會把測試 stdout 吃掉。
+      - name: M1 AC3 ffprobe（貼原始 JSON）
+        run: cargo test -p replay --test m1_acceptance ac3 -- --nocapture
 
       # 驗收標準 2：fixture 重放要走同一條重連狀態機，且宣告值全部符合。
       # 這裡的 grep 只證明 replay 真的跑完、印出成功字樣（--check 開著時才會印）；
