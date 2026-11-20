@@ -25,6 +25,11 @@ jobs:
 
       # ubuntu-latest 的 image **不含** ffmpeg（2024 之後已移除），要自己裝。
       # M1 AC3 用它證明復原後的段是真的可解碼的 h264，不是只有 EBML 結構對。
+      #
+      # 為什麼不釘版本：runner image 每兩週滾一次，若把 `ffmpeg=8.0.1-3ubuntu2` 這種
+      # 帶 distro 修訂號的版本釘死在 apt 上，image 一升版就變成「找不到套件」——CI 紅的
+      # 原因會從「段的結構壞了」變成「apt 版本跑掉了」，反而蓋掉真正的訊號。折衷做法是
+      # 不釘、但把實際版本印進 log（下面的 ffprobe -version），出事時追得到當時跑哪版。
       - name: Install ffmpeg
         run: |
           sudo apt-get update -qq
