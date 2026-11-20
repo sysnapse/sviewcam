@@ -47,6 +47,15 @@ pub struct EventRow {
     pub detail: String,
 }
 
+/// 目前索引 schema 版本（存在 `PRAGMA user_version`）。
+///
+/// - v1：M1 首版，`segments.gap_ms INTEGER NOT NULL`（沒有 user_version，視為 0/1）。
+/// - v2：`gap_ms` 可 NULL（復原收編段「未知」不再假裝 0）。
+///
+/// 之後 schema 只會繼續長欄位，所以升級一律走 [`SegmentIndex::migrate`]：
+/// 讀 `user_version` → 逐級搬資料 → 寫回版本。不要用「臨時判斷某欄長相」的 one-off。
+pub const SCHEMA_VERSION: i64 = 2;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS segments (
     segment_id  TEXT PRIMARY KEY,
@@ -92,8 +101,88 @@ impl SegmentIndex {
     fn init(conn: Connection) -> Result<Self> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute_batch(SCHEMA)?;
+        Self::migrate(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// 把既有索引升級到 [`SCHEMA_VERSION`]。
+    ///
+    /// 流程固定是「讀 `user_version` → 判斷要不要搬資料 → 建立缺少的表 → 寫回版本」，
+    /// 每多一版就多一個 `upgrade_N_to_M`，不做事後的臨時判斷。重複開啟是幂等的：
+    /// 版本已經是當前值就直接建表收工，`schema_upgrade` 事件只會寫一次。
+    fn migrate(conn: &Connection) -> Result<()> {
+        let version = Self::user_version(conn)?;
+        if version > SCHEMA_VERSION {
+            return Err(crate::error::Error::Config(format!(
+                "索引 schema 版本 {version} 比程式支援的 {SCHEMA_VERSION} 新，請升級程式（不要降級寫入）"
+            )));
+        }
+
+        // 沒有 user_version 的舊檔：靠欄位形狀認出 v1（gap_ms NOT NULL）。
+        let legacy_v1 = version < 2
+            && Self::has_table(conn, "segments")?
+            && Self::column_not_null(conn, "segments", "gap_ms")?;
+
+        if legacy_v1 {
+            let kept = Self::upgrade_1_to_2(conn)?;
+            // 建表（events 可能也缺）後才能寫事件
+            conn.execute_batch(SCHEMA)?;
+            conn.execute(
+                "INSERT INTO events (at_ms, kind, detail) VALUES (?1, ?2, ?3)",
+                params![
+                    0i64,
+                    "schema_upgrade",
+                    format!("索引 schema 由 v1 升級到 v{SCHEMA_VERSION}：gap_ms 改為可 NULL，保留 {kept} 筆段")
+                ],
+            )?;
+        } else {
+            conn.execute_batch(SCHEMA)?;
+        }
+
+        if version < SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        Ok(())
+    }
+
+    fn user_version(conn: &Connection) -> Result<i64> {
+        Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+    }
+
+    fn has_table(conn: &Connection, table: &str) -> Result<bool> {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    fn column_not_null(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let name: String = r.get(1)?;
+            let not_null: i64 = r.get(3)?;
+            if name == column {
+                return Ok(not_null != 0);
+            }
+        }
+        Ok(false)
+    }
+
+    /// v1 → v2：`gap_ms` 由 NOT NULL 改成可 NULL，既有資料原樣搬過去。回傳保留的段數。
+    fn upgrade_1_to_2(conn: &Connection) -> Result<i64> {
+        let kept: i64 = conn.query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0))?;
+        conn.execute_batch("ALTER TABLE segments RENAME TO segments_v1")?;
+        conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(
+            "INSERT INTO segments (segment_id, name, t_start, t_end, bytes, idr_offset, gap_ms, closed, repaired)
+             SELECT segment_id, name, t_start, t_end, bytes, idr_offset, gap_ms, closed, repaired
+             FROM segments_v1",
+        )?;
+        conn.execute_batch("DROP TABLE segments_v1")?;
+        Ok(kept)
     }
 
     /// 寫入或覆蓋一筆段資料。
@@ -241,6 +330,7 @@ impl SegmentIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn row(id: &str, t_start: u64, t_end: u64) -> SegmentRow {
         SegmentRow {
@@ -275,6 +365,109 @@ mod tests {
         assert_eq!(idx.rows().unwrap()[0].gap_ms, Some(1500));
         idx.delete("seg-000000000000").unwrap();
         assert_eq!(idx.count().unwrap(), 1);
+    }
+
+    /// 造一個 v1 的索引檔：`gap_ms INTEGER NOT NULL`、沒有 `user_version`。
+    fn make_legacy_v1_db(path: &Path) -> i64 {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE segments (
+                 segment_id  TEXT PRIMARY KEY,
+                 name        TEXT NOT NULL,
+                 t_start     INTEGER NOT NULL,
+                 t_end       INTEGER NOT NULL,
+                 bytes       INTEGER NOT NULL,
+                 idr_offset  INTEGER NOT NULL,
+                 gap_ms      INTEGER NOT NULL,
+                 closed      INTEGER NOT NULL,
+                 repaired    INTEGER NOT NULL
+             );
+             CREATE TABLE events (
+                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                 at_ms   INTEGER NOT NULL,
+                 kind    TEXT NOT NULL,
+                 detail  TEXT NOT NULL
+             );
+             INSERT INTO segments VALUES
+                 ('seg-000000002000', 'seg-000000002000.mkv', 2000, 4000, 1000, 200, 1500, 1, 0);",
+        )
+        .unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 0, "v1 的索引檔沒有 user_version");
+        version
+    }
+
+    fn temp_db(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "sview-index-{tag}-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::remove_file(&p).ok();
+        p
+    }
+
+    #[test]
+    fn opens_legacy_not_null_schema_and_accepts_null_gap() {
+        let path = temp_db("legacy");
+        make_legacy_v1_db(&path);
+
+        let idx = SegmentIndex::open(&path).unwrap();
+        let rows = idx.rows().unwrap();
+        assert_eq!(rows.len(), 1, "升級不該丟資料");
+        assert_eq!(rows[0].gap_ms, Some(1500), "既有 gap_ms 要原樣保留");
+
+        // 舊 schema 最大的坑：寫 None 會 NOT NULL constraint failed
+        let mut r = rows[0].clone();
+        r.segment_id = "seg-000000004000".to_string();
+        r.name = "seg-000000004000.mkv".to_string();
+        r.gap_ms = None;
+        idx.upsert(&r).expect("升級後必須能寫 gap_ms = NULL");
+        assert_eq!(idx.get("seg-000000004000").unwrap().unwrap().gap_ms, None);
+
+        assert_eq!(
+            idx.count_events("schema_upgrade").unwrap(),
+            1,
+            "升級要留一筆 schema_upgrade 事件"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let path = temp_db("idem");
+        make_legacy_v1_db(&path);
+
+        for _ in 0..3 {
+            let idx = SegmentIndex::open(&path).unwrap();
+            assert_eq!(idx.count().unwrap(), 1, "重複開啟不該重複搬或丟列");
+            assert_eq!(
+                idx.count_events("schema_upgrade").unwrap(),
+                1,
+                "schema_upgrade 只該寫一次"
+            );
+        }
+        let version: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn fresh_index_is_at_current_version() {
+        let idx = SegmentIndex::open_in_memory().unwrap();
+        let version: i64 = idx
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(idx.count_events("schema_upgrade").unwrap(), 0);
     }
 
     #[test]

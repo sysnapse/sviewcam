@@ -95,7 +95,8 @@ pub fn recover(dir: &Path, index: &mut SegmentIndex) -> Result<RecoveryReport> {
                         let t_start =
                             parse_t_start(&final_name).unwrap_or(info.t_start_ms);
                         let segment_id = final_name.trim_end_matches(SEGMENT_EXT).to_string();
-                        // 索引若已有這一列的 gap_ms 就保留；沒有的話記「未知」，不猜 0
+                        // `.part` 檔案在收段前不會進索引，所以這裡幾乎總是查不到列；
+                        // 查得到（例如同一段被修過一次）就沿用原值，否則記「未知」——不猜 0。
                         let gap_ms = index.get(&segment_id)?.and_then(|r| r.gap_ms);
                         index.upsert(&SegmentRow {
                             segment_id,
@@ -241,7 +242,24 @@ fn adopt_disk_orphans(
         let path = dir.join(&file_name);
         match mkv::scan(&path) {
             Ok(info) if info.is_closed() => {
-                let t_start = parse_t_start(&file_name).unwrap_or(info.t_start_ms);
+                // 檔名優先，但檔名亂標（複製檔案、手動改名）時會出現 t_end < t_start 的
+                // 反向區間；那就退回掃描到的實際時間，別讓索引帶著不可能的時間範圍。
+                let name_t = parse_t_start(&file_name);
+                let t_start = match name_t {
+                    Some(t) if t <= info.t_end_ms => t,
+                    Some(t) => {
+                        index.insert_event(
+                            info.t_end_ms,
+                            "adopted",
+                            &format!(
+                                "{file_name}：檔名時間 {t} 比段尾 {} 還晚，改用掃描時間 {}（檔名不可信）",
+                                info.t_end_ms, info.t_start_ms
+                            ),
+                        )?;
+                        info.t_start_ms
+                    }
+                    None => info.t_start_ms,
+                };
                 index.upsert(&SegmentRow {
                     segment_id: segment_id.clone(),
                     name: file_name.clone(),

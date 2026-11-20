@@ -210,7 +210,15 @@ fn kill_mid_write(tag: &str) -> (PathBuf, Vec<String>) {
     for attempt in 0..8 {
         let dir = data_dir(&format!("{tag}-{attempt}"));
         let after = kill_once(&dir);
-        if after.iter().any(|n| n.ends_with(".mkv.part")) {
+        let has_part = after.iter().any(|n| n.ends_with(".mkv.part"));
+        // 留紀錄：這件事如果常常靠重試才過，代表測試的時序假設太脆，要看得見。
+        eprintln!(
+            "[ac3] attempt {} → 砍完目錄 {} 個檔、半寫段 {}：{after:?}",
+            attempt,
+            after.len(),
+            if has_part { "還在" } else { "不見了（落在 rename 與開新段的窗口）" }
+        );
+        if has_part {
             return (dir, after);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -380,6 +388,11 @@ fn ac4_reconnect_gap_recorded_and_segments_not_merged() {
     );
     // ②首個 keyframe 的位移就是段開頭（沒有更早的 P 幀）——刻意解析成 bool 再比，
     //   避免與 idr_offset 同一個數字自我循環。
+    //
+    // 這條為什麼留著：它跟 ① 不是同一件事。① 由 scanner 讀檔案判定「首 block 是 IDR」；
+    // ② 再確認「第一個 keyframe 的位置就等於索引寫的 idr_offset」，也就是索引沒有把
+    // 段中間某個 keyframe 的位移誤記成段首。它確實用到 idr_offset，但和①一起才蓋住
+    // 「寫入器亂報位移」與「首 block 不是 IDR」兩種不同的壞法；單獨看它才是自證。
     let starts_at_keyframe =
         gap_info.first_keyframe_offset == Some(gap_row.idr_offset) && gap_info.blocks > 0;
     assert!(starts_at_keyframe, "gap 段第一個 keyframe 必須落在索引記的位移上");
@@ -435,6 +448,24 @@ fn recover_adopts_or_removes_orphan_segments() {
     );
     assert_eq!(after.len(), before.len() + 1, "只該多出被收編的那一段");
     assert!(!orphan_junk.exists(), "掃不過的孤兒檔要刪掉");
+
+    // 收編的時間不能自相矛盾：檔案內容的 t_start 是 1500，檔名卻標 9999999。
+    // 檔名不可信時要退回掃描到的時間，否則會出現 t_end < t_start 的反向區間。
+    let adopted = after
+        .iter()
+        .find(|r| r.segment_id == "seg-000009999999")
+        .expect("孤兒段要進索引");
+    let info = camcore::mkv::scan(&dir.join("seg-000009999999.mkv")).unwrap();
+    assert!(
+        adopted.t_start <= adopted.t_end,
+        "收編段的時間區間反了：t_start={} t_end={}",
+        adopted.t_start,
+        adopted.t_end
+    );
+    assert_eq!(
+        adopted.t_start, info.t_start_ms,
+        "檔名時間比段尾還晚時，要退回掃描到的 t_start"
+    );
 
     // 事件不得靜默
     let index = camcore::SegmentIndex::open(dir.join("index.sqlite")).unwrap();
