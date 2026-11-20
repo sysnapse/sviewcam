@@ -23,6 +23,19 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
+      # ubuntu-latest 的 image **不含** ffmpeg（2024 之後已移除），要自己裝。
+      # M1 AC3 用它證明復原後的段是真的可解碼的 h264，不是只有 EBML 結構對。
+      #
+      # 為什麼不釘版本：runner image 每兩週滾一次，若把 `ffmpeg=8.0.1-3ubuntu2` 這種
+      # 帶 distro 修訂號的版本釘死在 apt 上，image 一升版就變成「找不到套件」——CI 紅的
+      # 原因會從「段的結構壞了」變成「apt 版本跑掉了」，反而蓋掉真正的訊號。折衷做法是
+      # 不釘、但把實際版本印進 log（下面的 ffprobe -version），出事時追得到當時跑哪版。
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffprobe -version | head -1
+
       # 快取 cargo registry 與 target；key 綁版控內的 Cargo.lock。
       # lock 只需 commit 進 repo，hashFiles 才算得出東西；否則這兩個 key 都會退化成固定字串，
       # 變成任何分支共用一份永不更新的 cache。lock 換了 key 就跟著換，舊 key 由 restore-keys 撿回來暖機。
@@ -37,9 +50,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # 驗收標準 1：workspace 全測試（目前 29 passed / 0 failed）。
+      # 驗收標準 1：workspace 全測試（M0 29 個 + camcore 單元 + M1 AC1–AC4；AC5 標 ignored）。
+      #
+      # 一律加 `--locked`：沒有它的 CI 擋不住「manifest 改了但 Cargo.lock 沒跟上」——
+      # 測試照樣在 CI 綠，release 建置用 --locked 才爆出來，等於把問題延後到出貨前。
       - name: cargo test --workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      # M1 AC3：SIGKILL → 復原掃描，對每個閉合段跑真 ffprobe。
+      # 單獨再跑一次是為了 --nocapture：讓 ffprobe 的原始 JSON 進 CI log 當證據，
+      # 上面那步的 cargo test 會把測試 stdout 吃掉。
+      - name: M1 AC3 ffprobe（貼原始 JSON）
+        run: cargo test --locked -p replay --test m1_acceptance ac3 -- --nocapture
 
       # 驗收標準 2：fixture 重放要走同一條重連狀態機，且宣告值全部符合。
       # 這裡的 grep 只證明 replay 真的跑完、印出成功字樣（--check 開著時才會印）；
@@ -50,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo run -p replay -- \
+          cargo run --locked -p replay -- \
             --input fixtures/sview-m0.jsonl \
             --report /tmp/report.json \
             --annexb /tmp/session.h264 | tee /tmp/replay.log

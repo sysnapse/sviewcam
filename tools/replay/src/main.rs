@@ -1,11 +1,18 @@
 //! `replay`：把錄製封包（`.sviewcap.jsonl`）餵回同一條重連狀態機，無相機也能跑全鏈路。
 //!
-//! exit code：0 正常；3 fixture 內 `expected` 與實跑不符；4 fixture 解析失敗。
+//! exit code：0 正常；2 寫檔／錄影失敗；3 fixture 內 `expected` 與實跑不符；
+//! 4 fixture 解析失敗。
+//!
+//! M1 新增（TICKET-20261115-02）：
+//! - `--record-dir <dir>`：把 NAL 串流寫成 2 秒 MKV 段 + SQLite 索引（`camcore`）。
+//! - `--retain-minutes <n>`：保留窗（預設 5 分鐘、上限 15 分鐘，夾住時印**一則**警告）。
+//! - `--recover-only`：只跑啟動復原掃描並印結果（不重放）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use camcore::{RingConfig, RingWriter};
 use clap::Parser;
 use rtsp_core::replay::{ReplayFactory, ReplayFixture};
 use rtsp_core::sink::{FileSink, NalSink, NullSink};
@@ -26,6 +33,26 @@ struct Args {
     #[arg(long)]
     annexb: Option<PathBuf>,
 
+    /// 錄影資料目錄（MKV 段 + index.sqlite）
+    #[arg(long)]
+    record_dir: Option<PathBuf>,
+
+    /// 保留窗分鐘數（預設 5，上限 15）
+    #[arg(long)]
+    retain_minutes: Option<u64>,
+
+    /// 只跑啟動復原掃描（需 --record-dir）
+    #[arg(long)]
+    recover_only: bool,
+
+    /// 錄影視訊寬（寫進 MKV Video 元素）
+    #[arg(long, default_value_t = 2560)]
+    width: u32,
+
+    /// 錄影視訊高
+    #[arg(long, default_value_t = 1440)]
+    height: u32,
+
     /// 與 fixture 的 expected 比對（預設開啟；--check=false 可關）
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     check: bool,
@@ -35,9 +62,72 @@ struct Args {
     client_port: u16,
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+/// 同時把 NAL 交給錄影 sink 與 Annex-B 檔。
+struct Tee<'a> {
+    recording: &'a mut dyn NalSink,
+    annexb: Option<&'a mut FileSink>,
+}
+
+impl NalSink for Tee<'_> {
+    fn nal(&mut self, nal: &[u8]) {
+        self.recording.nal(nal);
+        if let Some(f) = self.annexb.as_deref_mut() {
+            f.nal(nal);
+        }
+    }
+
+    fn nal_at(&mut self, nal: &[u8], at_ms: u64) {
+        self.recording.nal_at(nal, at_ms);
+        if let Some(f) = self.annexb.as_deref_mut() {
+            f.nal_at(nal, at_ms);
+        }
+    }
+
+    fn gap(&mut self, at_ms: u64, gap_ms: u64, reason: &str) {
+        self.recording.gap(at_ms, gap_ms, reason);
+        if let Some(f) = self.annexb.as_deref_mut() {
+            f.gap(at_ms, gap_ms, reason);
+        }
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(real_main())
+}
+
+async fn real_main() -> std::process::ExitCode {
     let args = Args::parse();
+
+    // ---- 只跑復原掃描 ----
+    if args.recover_only {
+        let Some(dir) = &args.record_dir else {
+            eprintln!("錯誤：--recover-only 需要 --record-dir");
+            return std::process::ExitCode::from(2);
+        };
+        let mut index = match open_index(dir) {
+            Ok(index) => index,
+            Err(e) => {
+                // 與一般錄影啟動走同一條「錯誤：…」+ rc=2，不要在這裡 panic 帶 trace：
+                // 索引版本比程式新是使用者該處理的狀況，不是程式當掉。
+                eprintln!("錯誤：無法開啟索引 {}：{e}", dir.display());
+                return std::process::ExitCode::from(2);
+            }
+        };
+        match camcore::recover::recover(dir, &mut index) {
+            Ok(report) => {
+                println!("{}", serde_json::to_string_pretty(&recovery_json(&report)).unwrap());
+                return std::process::ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("錯誤：復原掃描失敗 {}：{e}", dir.display());
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
 
     let fixture = match ReplayFixture::load(&args.input) {
         Ok(f) => f,
@@ -56,6 +146,49 @@ async fn main() -> std::process::ExitCode {
     cfg.heartbeat = None;
     cfg.recv_timeout = Duration::from_secs(3600);
 
+    // ---- 錄影 sink ----
+    let mut ring: Option<RingWriter> = None;
+    if let Some(dir) = &args.record_dir {
+        let (mut ring_cfg, cfg_warnings) =
+            RingConfig::new(dir).with_retention_minutes(args.retain_minutes);
+        ring_cfg.width = args.width;
+        ring_cfg.height = args.height;
+        for w in &cfg_warnings {
+            // 走 stderr 的警告通道，不混進資料流；夾住只印一次
+            eprintln!("警告：{}（{}）", w.message, w.code);
+        }
+        match RingWriter::open(ring_cfg) {
+            Ok((writer, recovered)) => {
+                if !recovered.repaired.is_empty()
+                    || !recovered.discarded.is_empty()
+                    || !recovered.adopted.is_empty()
+                    || !recovered.removed_orphans.is_empty()
+                    || !recovered.pruned.is_empty()
+                    || recovered.index_rebuilt
+                {
+                    eprintln!(
+                        "復原掃描：修復 {}、丟棄 {}、收編孤兒 {}、刪孤兒檔 {}、清孤兒列 {}、重建索引 {}",
+                        recovered.repaired.len(),
+                        recovered.discarded.len(),
+                        recovered.adopted.len(),
+                        recovered.removed_orphans.len(),
+                        recovered.pruned.len(),
+                        recovered.index_rebuilt
+                    );
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&recovery_json(&recovered)).unwrap()
+                    );
+                }
+                ring = Some(writer);
+            }
+            Err(e) => {
+                eprintln!("錯誤：無法開啟錄影目錄 {}：{e}", dir.display());
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
     let mut file_sink: Option<FileSink> = match &args.annexb {
         Some(path) => match FileSink::create(path) {
             Ok(s) => Some(s),
@@ -66,10 +199,16 @@ async fn main() -> std::process::ExitCode {
         },
         None => None,
     };
+
     let mut null_sink = NullSink;
-    let sink: &mut dyn NalSink = match file_sink.as_mut() {
-        Some(s) => s,
-        None => &mut null_sink,
+    let sink: &mut dyn NalSink = match (ring.as_mut(), file_sink.as_mut()) {
+        (Some(r), Some(f)) => &mut Tee {
+            recording: r,
+            annexb: Some(f),
+        },
+        (Some(r), None) => r,
+        (None, Some(f)) => f,
+        (None, None) => &mut null_sink,
     };
 
     let mut log = |ev: Event| match ev {
@@ -85,6 +224,26 @@ async fn main() -> std::process::ExitCode {
     };
 
     let report = run(&factory, &cfg, &clock, sink, &mut log).await;
+
+    // ---- 收工：關閉最後一段 ----
+    if let Some(writer) = ring.as_mut() {
+        if let Err(e) = writer.finish() {
+            eprintln!("錯誤：收段失敗：{e}");
+            return std::process::ExitCode::from(2);
+        }
+        if let Some(e) = writer.take_error() {
+            eprintln!("錯誤：錄影失敗：{e}");
+            return std::process::ExitCode::from(2);
+        }
+        match recording_json(writer) {
+            Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
+            Err(e) => {
+                eprintln!("錯誤：讀索引失敗：{e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+
     let json = serde_json::to_string_pretty(&report).expect("report serialises");
     if let Some(path) = &args.report {
         if let Err(e) = std::fs::write(path, &json) {
@@ -132,4 +291,47 @@ async fn main() -> std::process::ExitCode {
     }
 
     std::process::ExitCode::SUCCESS
+}
+
+fn open_index(dir: &std::path::Path) -> camcore::Result<camcore::SegmentIndex> {
+    let cfg = RingConfig::new(dir);
+    camcore::SegmentIndex::open(cfg.index_path())
+}
+
+fn recovery_json(report: &camcore::RecoveryReport) -> serde_json::Value {
+    serde_json::json!({
+        "repaired": report.repaired,
+        "discarded": report.discarded,
+        "adopted": report.adopted,
+        "removed_orphans": report.removed_orphans,
+        "pruned": report.pruned,
+        "index_rebuilt": report.index_rebuilt,
+        "rows": report.rows,
+    })
+}
+
+fn recording_json(writer: &RingWriter) -> camcore::Result<serde_json::Value> {
+    let index = writer.index();
+    let rows = index.rows()?;
+    let events = index.events()?;
+    let t_start = rows.first().map(|r| r.t_start).unwrap_or(0);
+    let t_end = rows.last().map(|r| r.t_end).unwrap_or(0);
+    Ok(serde_json::json!({
+        "recording": {
+            "segments": rows.len(),
+            "bytes": index.total_bytes()?,
+            "t_start_ms": t_start,
+            "t_end_ms": t_end,
+            "span_ms": t_end.saturating_sub(t_start),
+            "gap_segments": rows.iter().filter(|r| r.gap_ms.map_or(false, |g| g > 0)).count(),
+            "event_count": events.len(),
+            "events": events.iter().map(|e| serde_json::json!({
+                "at_ms": e.at_ms, "kind": e.kind, "detail": e.detail,
+            })).collect::<Vec<_>>(),
+            "segments_detail": rows.iter().map(|r| serde_json::json!({
+                "segment_id": r.segment_id, "t_start": r.t_start, "t_end": r.t_end,
+                "bytes": r.bytes, "idr_offset": r.idr_offset, "gap_ms": r.gap_ms,
+            })).collect::<Vec<_>>(),
+        }
+    }))
 }

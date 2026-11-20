@@ -24,7 +24,7 @@ pub mod sink;
 pub use clock::{Clock, RealClock, VirtualClock};
 pub use error::{Error, Result};
 pub use link::{Link, LinkFactory};
-pub use replay::{ReplayFactory, ReplayFixture};
+pub use replay::{ReplayFactory, ReplayFixture, SynthSpec};
 pub use rtsp::USER_AGENT;
 pub use session::{run, Event, ReconnectPolicy, Report, RstClass, SessionConfig};
 pub use sink::{FileSink, NalSink, NullSink, VecSink};
