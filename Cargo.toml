@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/rtsp-core", "tools/probe", "tools/replay"]
+members = ["crates/camcore", "crates/rtsp-core", "tools/probe", "tools/replay"]
 
 [workspace.package]
 version = "0.1.0"

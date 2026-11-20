@@ -1,0 +1,8 @@
+{"type":"meta","name":"ac3_kill","note":"M1 AC3：kill -9 前的長串流 @60 kbps"}
+{"type":"conn","index":0}
+{"type":"rtsp_s2c","t_ms":1000,"data":"RTSP/1.0 200 OK\r\nCSeq: 1\r\nPublic: OPTIONS,DESCRIBE,SETUP,PLAY,PAUSE,TEARDOWN\r\n\r\n"}
+{"type":"rtsp_s2c","t_ms":1001,"data":"RTSP/1.0 200 OK\r\nCSeq: 2\r\nContent-Base: rtsp://192.168.1.1/test.264/\r\nContent-Type: application/sdp\r\nServer: sunshine/1.11\r\nContent-Length: 365\r\n\r\nv=0\r\no=-2209971456 2209971456 IN IP4 192.168.1.1\r\ns=Unnamed\r\nc=IN IP4 192.168.1.11\r\nt=0 0\r\na=recvonly\r\nm=video 5004 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=640029;sprop-parameter-sets=AAAAAWdNADKWNUBQAWtNwEBAQIA=,AAAAAWjuMbI=;\r\na=control:trackID=0\r\na=x-dimensions:2560,1440\r\na=SViewWifi:01234567890123456789012345678901\r\n"}
+{"type":"rtsp_s2c","t_ms":1002,"data":"RTSP/1.0 200 OK\r\nCSeq: 3\r\nSession: fixture-session;timeout=60\r\nTransport: RTP/AVP;unicast;client_port=20000-20001;destination=192.168.245.65;source=192.168.245.96;server_port=0-0\r\n\r\n"}
+{"type":"rtsp_s2c","t_ms":1003,"data":"RTSP/1.0 200 OK\r\nCSeq: 4\r\nSession: fixture-session\r\nRange: npt=0-\r\n\r\n"}
+{"type":"synth_stream","t_ms":1500,"duration_ms":1200000,"bitrate_bps":60000,"fps":25,"gop_ms":2000}
+{"type":"end"}

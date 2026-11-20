@@ -352,7 +352,7 @@ pub async fn run(
         // 相機的 sprop 已含起始碼：寫入前剝掉，避免出現 `00 00 00 01 00 00 00 01`。
         if !wrote_sprop && !info.sprop.is_empty() {
             for ps in info.parameter_sets() {
-                sink.nal(ps);
+                sink.nal_at(ps, clock.now_ms());
             }
             wrote_sprop = true;
         }
@@ -410,6 +410,9 @@ pub async fn run(
                                 if let Some(at) = gap_open_at.take() {
                                     let now = clock.now_ms();
                                     let ms = now.saturating_sub(at);
+                                    // 錄影 sink 用這個通知在段邊界留 gap 記錄（M1）。
+                                    // 順序在 NAL 之前：本會話首個 NAL 屬於「空窗之後」，不得併進前一節點。
+                                    sink.gap(now, ms, &gap_reason);
                                     rep.gaps.push(StreamGap {
                                         at_ms: at.saturating_sub(t0),
                                         ms,
@@ -472,7 +475,7 @@ pub async fn run(
                                             if rtp::is_keyframe(&nal) {
                                                 rep.keyframes += 1;
                                             }
-                                            sink.nal(&nal);
+                                            sink.nal_at(&nal, clock.now_ms());
                                         }
                                     }
                                     Err(e) => rep.errors.push(format!("depacket: {e}")),

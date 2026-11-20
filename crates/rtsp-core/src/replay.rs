@@ -7,7 +7,11 @@
 //! {"type":"rtsp_s2c","t_ms":1,"data":"RTSP/1.0 200 OK\r\n..."}
 //! {"type":"rtp","t_ms":500,"data":"<base64 RTP datagram>"}
 //! {"type":"rst","t_ms":61200}
+//! {"type":"synth_stream","t_ms":1500,"duration_ms":390000,"bitrate_bps":500000,"fps":25,"gop_ms":2000}
 //! ```
+//! `synth_stream` 不是錄下來的封包，而是重放時**確定性**合成 RTP（走同一條
+//! [`crate::rtp`] 組包／FU-A 路徑），讓 30 分鐘、12 Mbps 這種量級不必把 2.7 GB
+//! base64 塞進 JSONL。
 //! `rtsp_c2s` 行只作記錄（保留客戶端原話以便對照），重放時不驅動狀態。
 
 use std::collections::VecDeque;
@@ -20,6 +24,7 @@ use serde_json::Value;
 use crate::clock::VirtualClock;
 use crate::error::{Error, Result};
 use crate::link::{Link, LinkFactory};
+use crate::rtp;
 use crate::rtsp::{self, Response};
 
 #[derive(Debug, Clone, Default)]
@@ -37,6 +42,127 @@ pub enum StepKind {
     Response(String),
     Rtp(Vec<u8>),
     Rst,
+    /// 即時合成串流（`synth_stream`）：不把 2.7 GB base64 塞進 JSONL，
+    /// 由 [`SynthSpec`] 在重放時確定性生成 RTP。
+    Synth(SynthSpec),
+}
+
+/// 合成串流規格（fixture `{"type":"synth_stream", ...}`）。
+///
+/// 確定性要求：同一份 fixture 每次產生的位元組完全相同——不使用 wall clock、
+/// 不使用亂數，切片內容只由 frame 序號推導。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SynthSpec {
+    /// 首個 frame 的時間（毫秒，虛擬時鐘）。
+    pub start_ms: u64,
+    /// 串流長度（毫秒）。
+    pub duration_ms: u64,
+    /// 目標碼率（bps）。
+    pub bitrate_bps: u64,
+    /// 幀率。
+    pub fps: u32,
+    /// GOP 長度（毫秒）；IDR 邊界由 frame 時間推導。
+    pub gop_ms: u64,
+}
+
+impl SynthSpec {
+    /// RTP payload 上限（留給 IP/UDP 標頭）。
+    pub const MAX_RTP_PAYLOAD: usize = 1400;
+    /// 合成串流的 SSRC。
+    pub const SSRC: u32 = 0x1122_3344;
+    /// 合成串流的 payload type。
+    pub const PAYLOAD_TYPE: u8 = 96;
+    /// 決定性 SPS（與 fixture SDP 的 sprop 一致）。
+    pub const SPS: [u8; 16] = [
+        0x67, 0x4D, 0x00, 0x32, 0x96, 0x35, 0x40, 0x50, 0x01, 0x6B, 0x4D, 0xC0, 0x40, 0x40, 0x40,
+        0x80,
+    ];
+    /// 決定性 PPS。
+    pub const PPS: [u8; 4] = [0x68, 0xEE, 0x31, 0xB2];
+
+    /// 總 frame 數。
+    pub fn frames(&self) -> u64 {
+        self.duration_ms.saturating_mul(self.fps as u64) / 1000
+    }
+
+    /// 第 `i` 個 frame 的時間（毫秒）。
+    pub fn frame_ms(&self, i: u64) -> u64 {
+        self.start_ms + i.saturating_mul(1000) / self.fps as u64
+    }
+
+    /// 每個 frame 的 slice bytes（依碼率推導）。
+    pub fn frame_bytes(&self) -> usize {
+        // bitrate_bps 是 bits/sec：每個 frame 的位元組 = bps / (fps * 8)
+        (self.bitrate_bps / (self.fps as u64 * 8)).max(16) as usize
+    }
+
+    /// 第 `i` 個 frame 是否為 IDR（GOP 對齊）。
+    pub fn is_idr(&self, i: u64) -> bool {
+        if self.gop_ms == 0 {
+            i == 0
+        } else {
+            (i.saturating_mul(1000) / self.fps as u64) % self.gop_ms == 0
+        }
+    }
+
+    /// 決定性切片內容（線性同餘，只由 frame 序號推導）。
+    fn slice_bytes(&self, i: u64) -> Vec<u8> {
+        let len = self.frame_bytes();
+        let mut out = Vec::with_capacity(len);
+        let mut s = i.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        while out.len() < len {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            out.push((s >> 33) as u8);
+        }
+        out
+    }
+
+    /// 第 `i` 個 frame 的 RTP 封包（IDR 前帶 SPS/PPS；大 NAL 走 FU-A）。
+    pub fn frame_packets(&self, i: u64, seq: &mut u16) -> Vec<Vec<u8>> {
+        let t_ms = self.frame_ms(i);
+        let ts = (t_ms.saturating_mul(90)) as u32;
+        let mut out = Vec::new();
+        if self.is_idr(i) {
+            self.push_nal(&Self::SPS, seq, ts, &mut out);
+            self.push_nal(&Self::PPS, seq, ts, &mut out);
+        }
+        let mut nal = Vec::with_capacity(self.frame_bytes() + 1);
+        nal.push(if self.is_idr(i) { 0x65 } else { 0x41 });
+        nal.extend_from_slice(&self.slice_bytes(i));
+        self.push_nal(&nal, seq, ts, &mut out);
+        out
+    }
+
+    fn push_nal(&self, nal: &[u8], seq: &mut u16, ts: u32, out: &mut Vec<Vec<u8>>) {
+        if nal.len() <= Self::MAX_RTP_PAYLOAD {
+            out.push(rtp::build(*seq, ts, Self::SSRC, true, Self::PAYLOAD_TYPE, nal));
+            *seq = seq.wrapping_add(1);
+            return;
+        }
+        let body = &nal[1..];
+        let chunk = Self::MAX_RTP_PAYLOAD - 2;
+        let count = body.len().div_ceil(chunk);
+        for k in 0..count {
+            let start = k * chunk;
+            let end = (start + chunk).min(body.len());
+            let mut fu = Vec::with_capacity(2 + end - start);
+            fu.push((nal[0] & 0xe0) | 28);
+            let mut hdr = nal[0] & 0x1f;
+            if k == 0 {
+                hdr |= 0x80;
+            }
+            if k == count - 1 {
+                hdr |= 0x40;
+            }
+            fu.push(hdr);
+            fu.extend_from_slice(&body[start..end]);
+            let marker = k == count - 1;
+            out.push(rtp::build(*seq, ts, Self::SSRC, marker, Self::PAYLOAD_TYPE, &fu));
+            *seq = seq.wrapping_add(1);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +238,34 @@ impl ReplayFixture {
                     current.get_or_insert_with(Vec::new).push(Step { t_ms, kind: StepKind::Rtp(bytes) });
                 }
                 "rst" => current.get_or_insert_with(Vec::new).push(Step { t_ms, kind: StepKind::Rst }),
+                "synth_stream" => {
+                    let duration_ms = v
+                        .get("duration_ms")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| Error::Protocol(format!("line {}: synth_stream without duration_ms", lineno + 1)))?;
+                    if duration_ms == 0 {
+                        return Err(Error::Protocol(format!("line {}: synth_stream duration_ms must be > 0", lineno + 1)));
+                    }
+                    let fps = v.get("fps").and_then(Value::as_u64).unwrap_or(25) as u32;
+                    if fps == 0 {
+                        return Err(Error::Protocol(format!("line {}: synth_stream fps must be > 0", lineno + 1)));
+                    }
+                    let bitrate_bps = v
+                        .get("bitrate_bps")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| Error::Protocol(format!("line {}: synth_stream without bitrate_bps", lineno + 1)))?;
+                    let gop_ms = v.get("gop_ms").and_then(Value::as_u64).unwrap_or(2_000);
+                    current.get_or_insert_with(Vec::new).push(Step {
+                        t_ms,
+                        kind: StepKind::Synth(SynthSpec {
+                            start_ms: t_ms,
+                            duration_ms,
+                            bitrate_bps,
+                            fps,
+                            gop_ms,
+                        }),
+                    });
+                }
                 "end" => {
                     if let Some(steps) = current.take() {
                         fixture.connections.push(steps);
@@ -165,6 +319,12 @@ struct ReplayLink {
     pending: VecDeque<Response>,
     clock: Arc<VirtualClock>,
     client_port: u16,
+    /// 合成串流已產生的 frame 數。
+    synth_pos: u64,
+    /// 已生成、待送出的合成 RTP 封包（時間, bytes）。
+    synth_queue: VecDeque<(u64, Vec<u8>)>,
+    /// 合成串流的下一個 RTP 序號。
+    synth_seq: u16,
 }
 
 #[async_trait]
@@ -199,7 +359,14 @@ impl Link for ReplayLink {
     }
 
     async fn recv_rtp(&mut self) -> Result<Vec<u8>> {
-        while self.idx < self.steps.len() {
+        loop {
+            if let Some((t, data)) = self.synth_queue.pop_front() {
+                self.clock.advance_to(t);
+                return Ok(data);
+            }
+            if self.idx >= self.steps.len() {
+                return Err(Error::EndOfInput);
+            }
             let t = self.steps[self.idx].t_ms;
             match &self.steps[self.idx].kind {
                 StepKind::Rtp(data) => {
@@ -219,9 +386,32 @@ impl Link for ReplayLink {
                     self.pending.push_back(resp);
                     self.idx += 1;
                 }
+                StepKind::Synth(spec) => {
+                    // 下一個明確步驟的時間是合成串流的上限（讓 fixture 的 rst 能準時打斷）
+                    let limit = self.steps.get(self.idx + 1).map(|s| s.t_ms);
+                    let total = spec.frames();
+                    let mut produced = false;
+                    while self.synth_pos < total {
+                        let frame_ms = spec.frame_ms(self.synth_pos);
+                        if let Some(limit) = limit {
+                            if frame_ms >= limit {
+                                break;
+                            }
+                        }
+                        for pkt in spec.frame_packets(self.synth_pos, &mut self.synth_seq) {
+                            self.synth_queue.push_back((frame_ms, pkt));
+                        }
+                        self.synth_pos += 1;
+                        produced = true;
+                        break;
+                    }
+                    if !produced {
+                        self.idx += 1;
+                        self.synth_pos = 0;
+                    }
+                }
             }
         }
-        Err(Error::EndOfInput)
     }
 }
 
@@ -243,6 +433,9 @@ impl LinkFactory for ReplayFactory {
                 pending: VecDeque::new(),
                 clock: self.clock.clone(),
                 client_port: self.client_port,
+                synth_pos: 0,
+                synth_queue: VecDeque::new(),
+                synth_seq: 1,
             }),
             self.client_port,
         ))

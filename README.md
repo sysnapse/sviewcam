@@ -8,7 +8,8 @@ Rust 桌面客戶端（目標：接 WiFi 相機、看即時串流、截圖、抓
 | 階段 | 內容 | 狀態 |
 |---|---|---|
 | M0 | `rtsp-core` ＋ `tools/probe` ＋ `tools/replay` ＋ 合成 fixture | in-dev（fixture 標準 1–2 已可驗；真機標準 3–5 待相機測試窗） |
-| M1–M5 | 環形緩衝、匯出、camd 常駐、egui GUI、杰理骨架 | ticket draft |
+| M1 | `camcore` 磁碟環形緩衝 ＋ SQLite 索引 ＋ 啟動復原 | in-dev（AC1–AC4 已綠；AC5 為 `#[ignore]` 手動跑） |
+| M2–M5 | 匯出、camd 常駐、egui GUI、杰理骨架 | ticket draft |
 
 ## 目標架構（v3 規劃）
 
@@ -22,6 +23,8 @@ Rust 桌面客戶端（目標：接 WiFi 相機、看即時串流、截圖、抓
 
 ```sh
 cargo test --workspace                 # 全部測試（無相機可跑）
+cargo test -p replay --test m1_acceptance            # M1 AC1–AC4
+cargo test -p replay --release -- --ignored ac5      # M1 AC5（30 分鐘 @12 Mbps，慢）
 cargo run -p replay -- \
   --input fixtures/sview-m0.jsonl \
   --report /tmp/report.json --annexb /tmp/session.h264
@@ -38,6 +41,30 @@ SVIEW_TOKEN=<32 位數字> cargo run -p probe -- \
 與 `gaps` 的收口點（RST→本會話首個 RTP）是同一個事件。相機 PLAY 200 之後不送流的會話
 即使握手全綠也不算續流——它會落入 RST 三類分類（多半是即時拒絕）並計入 `disconnects`，
 而不是被誤記成「已重連成功」。
+
+## M1：環形緩衝與段索引
+
+`crates/camcore` 把「拉到的 NAL 流」寫成可回放的 2 秒 MKV 段，並用 SQLite 索引回答「前 X 分鐘在哪些檔案裡」。
+時間**一律**取 host 單調時鐘（`Clock::now_ms()`）；相機時鐘停在 1970-01-12，不可用於排序。
+
+| 模組 | 職責 |
+|---|---|
+| `camcore::ring` | 2 秒一段、GOP 對齊、4 秒強切、滿窗刪最舊、預配置 8 MiB |
+| `camcore::mkv` | 自寫 EBML/Matroska：unknown-size Segment、known-size Cluster、SimpleBlock、AVCC CodecPrivate；`scan()` 對截斷檔回報 `truncated` 與「最後一個完整 Cluster 結尾位移」 |
+| `camcore::index` | `segments`（`t_start`/`t_end`/`bytes`/`idr_offset`/`gap_ms`/`closed`/`repaired`）＋ `events`（gap、防呆補記、強切、復原動作） |
+| `camcore::recover` | 啟動掃描：`.mkv.part` 有完整 Cluster 就修復改名、否則丟棄並留事件；清孤兒列；索引缺失時按檔名時序重建 |
+
+```sh
+cargo run -p replay -- --input fixtures/m1/ac1_six_min.jsonl \
+  --record-dir /tmp/rec --retain-minutes 5
+cargo run -p replay -- --input fixtures/m1/ac1_six_min.jsonl \
+  --record-dir /tmp/rec --recover-only      # 只跑啟動復原掃描
+```
+
+- **保留窗**：預設 5 分鐘，上限 15 分鐘（`HARD_MAX_WINDOW_MS`）。要求超過上限時夾住並**輸出一次**警告（`retention.clamped`），不靜默。
+- **重連 gap**：空窗收口時 `NalSink::gap()` 通知 ring——關閉當前段、下一段 `gap_ms > 0`、並強制從 IDR 起新段，gap 前後絕不串成同一段。
+- **防呆補記**：相鄰 NAL 相隔超過 250 ms 卻沒收到 gap 事件時，仍關段並記 `implicit_gap` 事件（有記錄的補記，不是靜默）。
+- **合成串流**：fixture 的 `{"type":"synth_stream"}` 在重放時確定性合成 RTP（同一 fixture 每次位元組相同），走既有 `rtp::build` + FU-A 路徑，不需要把 GB 級 base64 塞進 JSONL。
 
 ## 故障注入 harness（重連鑑別力）
 

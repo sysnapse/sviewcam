@@ -10,7 +10,11 @@ name = "replay"
 path = "src/main.rs"
 
 [dependencies]
+camcore = { path = "../../crates/camcore" }
 rtsp-core = { path = "../../crates/rtsp-core" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+camcore = { path = "../../crates/camcore" }
