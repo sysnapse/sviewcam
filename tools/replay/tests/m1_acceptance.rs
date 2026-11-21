@@ -77,7 +77,13 @@ fn assert_segments_intact(dir: &Path, rows: &[camcore::SegmentRow]) {
             row.name
         );
         // 段的開頭必須能獨立解碼：這條由掃描器直接讀檔案的 flags 位元組判定，
-        // 不看寫入器回報的 idr_offset（兩條獨立路徑，避免自證）
+        // 不看寫入器回報的 idr_offset（兩條獨立路徑，避免自證）。
+        // 索引旗標必須與掃描結果一致；這組 fixture 沒有觸發上限硬切，所以只能是 true。
+        assert_eq!(
+            row.first_block_keyframe, info.first_block_keyframe,
+            "{} 索引的 first_block_keyframe 與掃描器不符",
+            row.name
+        );
         assert_eq!(
             info.first_block_keyframe,
             Some(true),
@@ -791,7 +797,7 @@ fn recover_only_rejects_newer_index_version_without_panic() {
         "要沿用一般啟動的錯誤格式：{stderr}"
     );
     assert!(
-        stderr.contains("比程式支援的 2 新"),
+        stderr.contains("比程式支援的 3 新"),
         "錯誤訊息要說清楚版本問題：{stderr}"
     );
     assert!(
