@@ -34,25 +34,27 @@ cd "$(dirname "$0")/.."
 # devbox 的 rust 模板（alpine）不在非互動 shell 的 PATH 裡放 cargo，自己補上。
 command -v cargo >/dev/null 2>&1 || PATH="/usr/local/cargo/bin:$PATH"
 export PATH
-SRC=crates/rtsp-core/src/session.rs
+SRC_SESSION=crates/rtsp-core/src/session.rs
 SRC_RING=crates/camcore/src/ring.rs
-BAK=/tmp/mutant-harness.orig.rs
+BAK_SESSION=/tmp/mutant-harness.orig.rs
 BAK_RING=/tmp/mutant-harness.orig-ring.rs
+SRC=$SRC_SESSION
+BAK=$BAK_SESSION
 LOGS=/tmp/mutant-harness-logs
 TARGET=${1:-all}
 
-[ -f "$SRC" ] || { echo "找不到 $SRC（要在 repo 根跑）"; exit 4; }
+[ -f "$SRC_SESSION" ] || { echo "找不到 $SRC_SESSION（要在 repo 根跑）"; exit 4; }
 [ -f "$SRC_RING" ] || { echo "找不到 $SRC_RING（要在 repo 根跑）"; exit 4; }
 mkdir -p "$LOGS"
-cp "$SRC" "$BAK"
+cp "$SRC_SESSION" "$BAK_SESSION"
 cp "$SRC_RING" "$BAK_RING"
-SUM=$(sha256sum "$SRC" | cut -d' ' -f1)
+SUM=$(sha256sum "$SRC_SESSION" | cut -d' ' -f1)
 SUM_RING=$(sha256sum "$SRC_RING" | cut -d' ' -f1)
 
 restore() {
-    cp "$BAK" "$SRC"
+    cp "$BAK_SESSION" "$SRC_SESSION"
     cp "$BAK_RING" "$SRC_RING"
-    NOW=$(sha256sum "$SRC" | cut -d' ' -f1)
+    NOW=$(sha256sum "$SRC_SESSION" | cut -d' ' -f1)
     NOW_RING=$(sha256sum "$SRC_RING" | cut -d' ' -f1)
     if [ "$NOW" != "$SUM" ] || [ "$NOW_RING" != "$SUM_RING" ]; then
         echo "！！原始碼還原失敗：session.rs 或 ring.rs 已與跑之前的 sha256 不一致，請手動 git checkout"
