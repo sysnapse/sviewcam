@@ -416,6 +416,53 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 舊行為（k23 的 `forced_cut_when_segment_overruns_without_idr`）在段滿
+    /// `force_cut_ms` 就立刻切成兩段；延後強切後，同樣的輸入只會有一段——
+    /// 門檻只是「開始等 IDR」的記號，不是切點。這是舊期望不再成立的直接原因。
+    #[test]
+    fn forced_cut_defers_past_force_threshold_until_finish() {
+        let dir = tmp_dir("forced-cut-no-idr");
+        let (mut w, _report) = RingWriter::open(RingConfig::new(&dir)).unwrap();
+        w.nal_at(&SPS, 0);
+        w.nal_at(&PPS, 0);
+        w.nal_at(&IDR, 0);
+        for t in (100..=4000).step_by(100) {
+            w.nal_at(&P, t);
+        }
+        assert!(w.take_error().is_none());
+        w.finish().unwrap();
+        assert!(w.take_error().is_none());
+
+        let rows = w.index().rows().unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "force_cut 門檻不再切段；沒有 IDR 時整段到收工才結束：{rows:?}"
+        );
+        assert_eq!(rows[0].t_start, 0);
+        assert_eq!(rows[0].t_end, 4000);
+        assert_eq!(rows[0].first_block_keyframe, Some(true));
+        assert!(
+            rows[0].bytes > 1000,
+            "等待期間的 P 幀要留在同段：{:?}",
+            rows[0]
+        );
+        let events = w.index().events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == "forced_cut_deferred")
+                .count(),
+            1,
+            "跨過門檻要記延後事件：{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.kind == "forced_cut"),
+            "還沒到硬上限就不該有 forced_cut：{events:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 延後強切：段滿 `segment_ms` 仍無 IDR 時不立刻硬切，先記事件繼續等；
     /// 等到 IDR 才切，段首仍是 keyframe，且等待期間的 P 幀全部留在原段、不丟畫面。
     #[test]
