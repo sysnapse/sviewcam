@@ -331,6 +331,7 @@ fn recording_json(writer: &RingWriter) -> camcore::Result<serde_json::Value> {
             "segments_detail": rows.iter().map(|r| serde_json::json!({
                 "segment_id": r.segment_id, "t_start": r.t_start, "t_end": r.t_end,
                 "bytes": r.bytes, "idr_offset": r.idr_offset, "gap_ms": r.gap_ms,
+                "first_block_keyframe": r.first_block_keyframe,
             })).collect::<Vec<_>>(),
         }
     }))

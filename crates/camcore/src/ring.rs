@@ -4,8 +4,10 @@
 //!
 //! - **GOP 對齊**：段長滿 [`RingConfig::segment_ms`] 後，等到下一個 IDR（NAL type 5）
 //!   才切；切點段的第一個 block 一定帶 SPS+PPS。
-//! - **強切**：若一直等不到 IDR 而段已滿 [`RingConfig::force_cut_ms`]，就在此處硬切
-//!   並記一則 `forced_cut` event（不靜默）。
+//! - **延後強切**：段滿 [`RingConfig::segment_ms`] 後若一直等不到 IDR，超過
+//!   [`RingConfig::force_cut_ms`] 先記一則 `forced_cut_deferred` 並繼續等；段長達
+//!   [`RingConfig::force_cut_limit_ms`]（預設 4×）硬上限才真的硬切，記一則
+//!   `forced_cut`，且新段從非 keyframe 開始、索引標成不可獨立回放（不靜默）。
 //! - **重連 gap**：session 在空窗收口時呼叫 [`rtsp_core::sink::NalSink::gap`]，本模組
 //!   立刻關閉當前段（段尾停在 gap 起點），下一段的 `gap_ms` 記下空窗長度，並**等到
 //!   IDR 才開段**——斷流前後永遠不會被串成同一段，段首也一定可獨立解碼。等待期間
@@ -38,6 +40,8 @@ struct Current {
     blocks: usize,
     gap_ms: u64,
     sps_prefix: Vec<u8>,
+    /// 本段第一個 block 是否 keyframe（正常開段／GOP 切為 true；上限硬切為 false）。
+    first_is_keyframe: bool,
 }
 
 /// MKV 環形緩衝寫入器（實作 [`NalSink`]）。
@@ -51,6 +55,8 @@ pub struct RingWriter {
     waiting_idr: bool,
     last_ms: Option<u64>,
     pending_gap: Option<(u64, String)>,
+    /// 已進入延後強切期（每段只記一則 `forced_cut_deferred`）。
+    deferred_since: Option<u64>,
     error: Option<Error>,
 }
 
@@ -69,6 +75,7 @@ impl RingWriter {
             waiting_idr: false,
             last_ms: None,
             pending_gap: None,
+            deferred_since: None,
             error: None,
         };
         // 索引重建後若已超過窗，先修剪一次
@@ -142,7 +149,7 @@ impl RingWriter {
 
         if self.cur.is_none() {
             if keyframe {
-                self.start_segment(at_ms)?;
+                self.start_segment(at_ms, true)?;
             } else {
                 // 段的開頭必須是 IDR；P 幀續流就先等，記一則事件讓 hook 漏報看得見
                 self.note_waiting_idr(at_ms)?;
@@ -154,18 +161,34 @@ impl RingWriter {
             if elapsed >= self.cfg.segment_ms {
                 if keyframe {
                     self.close_segment(at_ms)?;
-                    self.start_segment(at_ms)?;
+                    self.start_segment(at_ms, true)?;
                 } else if elapsed >= self.cfg.force_cut_ms {
-                    self.index.insert_event(
-                        at_ms,
-                        "forced_cut",
-                        &format!(
-                            "段 {t_start} 已滿 {} ms 仍無 IDR，於 {at_ms} 強切（新段從非 keyframe 開始）",
-                            self.cfg.force_cut_ms
-                        ),
-                    )?;
-                    self.close_segment(at_ms)?;
-                    self.start_segment(at_ms)?;
+                    let limit = self.cfg.force_cut_limit_ms();
+                    if self.deferred_since.is_none() {
+                        self.deferred_since = Some(at_ms);
+                        self.index.insert_event(
+                            at_ms,
+                            "forced_cut_deferred",
+                            &format!(
+                                "段 {t_start} 已滿 {} ms 仍無 IDR，於 {at_ms} 延後強切等 IDR（段長硬上限 {limit} ms）",
+                                self.cfg.force_cut_ms
+                            ),
+                        )?;
+                    }
+                    // 到了硬上限還沒有 IDR，只能從當前非 keyframe 硬切；新段不可獨立回放，
+                    // 索引會如實記 first_block_keyframe=false。
+                    if elapsed >= limit {
+                        self.index.insert_event(
+                            at_ms,
+                            "forced_cut",
+                            &format!(
+                                "段 {t_start} 已滿 {} ms 仍無 IDR，於 {at_ms} 強切（已達 {limit} ms 上限，新段從非 keyframe 開始，不可獨立回放）",
+                                self.cfg.force_cut_ms
+                            ),
+                        )?;
+                        self.close_segment(at_ms)?;
+                        self.start_segment(at_ms, false)?;
+                    }
                 }
             }
         }
@@ -218,7 +241,7 @@ impl RingWriter {
         Ok(())
     }
 
-    fn start_segment(&mut self, at_ms: u64) -> Result<()> {
+    fn start_segment(&mut self, at_ms: u64, first_is_keyframe: bool) -> Result<()> {
         let (Some(sps), Some(pps)) = (self.sps.clone(), self.pps.clone()) else {
             return Err(Error::Config(
                 "還沒收到 SPS/PPS，無法開始錄影段".into(),
@@ -240,6 +263,7 @@ impl RingWriter {
         AvcConfig::append_avcc(&avc.pps, &mut sps_prefix);
 
         self.waiting_idr = false;
+        self.deferred_since = None;
         let (gap_ms, reason) = self.pending_gap.take().unwrap_or((0, String::new()));
         if gap_ms > 0 {
             self.index.insert_event(
@@ -258,6 +282,7 @@ impl RingWriter {
             blocks: 0,
             gap_ms,
             sps_prefix,
+            first_is_keyframe,
         });
         Ok(())
     }
@@ -266,6 +291,7 @@ impl RingWriter {
         let Some(mut cur) = self.cur.take() else {
             return Ok(());
         };
+        self.deferred_since = None;
         let sum = cur.writer.finish()?;
         fs::rename(&cur.part, &cur.final_path)?;
         self.index.upsert(&SegmentRow {
@@ -275,6 +301,7 @@ impl RingWriter {
             t_end: sum.t_end.max(t_end_ms).max(cur.t_start),
             bytes: sum.bytes,
             idr_offset: sum.idr_offset,
+            first_block_keyframe: Some(cur.first_is_keyframe),
             gap_ms: Some(cur.gap_ms),
             closed: true,
             repaired: false,
@@ -389,20 +416,72 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 強切：段滿 `segment_ms` 卻一直沒有 IDR，超過 `force_cut_ms` 就切。
-    ///
-    /// 目前產品語義是 B（k23 只釘住邊界與 gap 值）：強切後**不**等 IDR，新段第一幀就是
-    /// 觸發強切的那個 P 幀，所以那一段不能獨立回放。行為變更（改成強切後也等 IDR）由
-    /// k24 另行處理，這裡刻意**不**斷言 `first_block_keyframe`，免得把缺陷寫成期望值。
+    /// 延後強切：段滿 `segment_ms` 仍無 IDR 時不立刻硬切，先記事件繼續等；
+    /// 等到 IDR 才切，段首仍是 keyframe，且等待期間的 P 幀全部留在原段、不丟畫面。
     #[test]
-    fn forced_cut_when_segment_overruns_without_idr() {
-        let dir = tmp_dir("forced-cut");
+    fn forced_cut_defers_until_idr_without_losing_frames() {
+        let dir = tmp_dir("forced-cut-defer");
         let (mut w, _report) = RingWriter::open(RingConfig::new(&dir)).unwrap();
         w.nal_at(&SPS, 0);
         w.nal_at(&PPS, 0);
         w.nal_at(&IDR, 0);
-        // 每 100 ms 一個 P 幀（間隔 < IMPLICIT_GAP_MS=250，不會誤觸防呆），到 4000 ms
-        for t in (100..=4000).step_by(100) {
+        // 每 100 ms 一個 P 幀（間隔 < IMPLICIT_GAP_MS=250，不會誤觸防呆），到 5900 ms
+        for t in (100..=5900).step_by(100) {
+            w.nal_at(&P, t);
+        }
+        // 4000 ms 進延後期；6000 ms 的 IDR 才收段
+        w.nal_at(&IDR, 6000);
+        w.nal_at(&P, 6040);
+        assert!(w.take_error().is_none());
+        w.finish().unwrap();
+        assert!(w.take_error().is_none());
+
+        let rows = w.index().rows().unwrap();
+        assert_eq!(rows.len(), 2, "延後到 IDR 才切，只該兩段：{rows:?}");
+        assert_eq!(rows[0].t_start, 0, "{rows:?}");
+        assert_eq!(rows[0].t_end, 6000, "切點是 IDR 的時間，不是 force_cut 門檻");
+        assert_eq!(rows[1].t_start, 6000, "新段從 IDR 開始");
+        assert_eq!(rows[1].gap_ms, Some(0), "延後強切不是斷流，不該記 gap");
+        assert_eq!(rows[0].first_block_keyframe, Some(true), "原段首是 IDR");
+        assert_eq!(rows[1].first_block_keyframe, Some(true), "新段首是 IDR");
+        let info = crate::mkv::scan(dir.join(&rows[1].name)).unwrap();
+        assert_eq!(info.first_block_keyframe, Some(true), "新段首 block 必須是 keyframe");
+
+        let events = w.index().events().unwrap();
+        let deferred: Vec<_> = events
+            .iter()
+            .filter(|e| e.kind == "forced_cut_deferred")
+            .collect();
+        assert_eq!(deferred.len(), 1, "延後只記一筆：{events:?}");
+        assert!(
+            deferred[0].detail.contains("4000"),
+            "事件要帶門檻時間：{:?}",
+            deferred[0]
+        );
+        assert!(
+            !events.iter().any(|e| e.kind == "forced_cut"),
+            "有在期限內等到 IDR，不該真的硬切：{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.kind == "implicit_gap"),
+            "間隔都在 250 ms 內，不該有 implicit_gap：{events:?}"
+        );
+        // 等待期間的 P 幀沒有被丟掉：第一段實際 bytes 遠大於只有 header 的空段
+        assert!(rows[0].bytes > 1000, "P 幀續流要留在原段：{:?}", rows[0]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 硬上限：一直沒有 IDR，段長到 4×force_cut_ms 才真的硬切；新段首不是 keyframe，
+    /// 索引必須如實記 `first_block_keyframe=false`（不可獨立回放），不得靜默。
+    #[test]
+    fn forced_cut_falls_back_at_hard_limit_and_flags_segment() {
+        let dir = tmp_dir("forced-cut-limit");
+        let (mut w, _report) = RingWriter::open(RingConfig::new(&dir)).unwrap();
+        w.nal_at(&SPS, 0);
+        w.nal_at(&PPS, 0);
+        w.nal_at(&IDR, 0);
+        // 之後再也沒有 IDR；每 100 ms 一個 P 幀到 17500 ms
+        for t in (100..=17500).step_by(100) {
             w.nal_at(&P, t);
         }
         assert!(w.take_error().is_none());
@@ -410,22 +489,46 @@ mod tests {
         assert!(w.take_error().is_none());
 
         let rows = w.index().rows().unwrap();
-        assert_eq!(rows.len(), 2, "強切只該產生兩段：{rows:?}");
-        // 段滿 2000 ms 不切（沒有 IDR），要等到 force_cut_ms=4000 才切
-        assert_eq!(rows[0].t_start, 0, "{rows:?}");
-        assert_eq!(rows[0].t_end, 4000, "切點在強切那一刻，不是 segment_ms 滿的那一刻");
-        assert_eq!(rows[1].t_start, 4000, "新段從強切的那個 NAL 開始");
-        // 0＝已知沒有斷流（強切不是 gap），與 None＝未知不同；不要寫成 NULL。
-        assert_eq!(rows[1].gap_ms, Some(0), "強切不是斷流，不該記 gap");
-        assert_eq!(rows[0].gap_ms, Some(0));
+        assert_eq!(rows.len(), 2, "16 s 上限應只切一次：{rows:?}");
+        assert_eq!(rows[0].t_start, 0);
+        assert_eq!(rows[0].t_end, 16000, "硬上限是 4×force_cut_ms=16000");
+        assert_eq!(rows[0].first_block_keyframe, Some(true));
+        assert_eq!(rows[1].t_start, 16000, "新段從硬切的那個 P 幀開始");
+        assert_eq!(
+            rows[1].first_block_keyframe,
+            Some(false),
+            "非 keyframe 起段要如實標記：{rows:?}"
+        );
+        let info = crate::mkv::scan(dir.join(&rows[1].name)).unwrap();
+        assert_eq!(
+            info.first_block_keyframe,
+            Some(false),
+            "scanner 獨立重算也必須是 false"
+        );
 
         let events = w.index().events().unwrap();
-        let forced: Vec<_> = events.iter().filter(|e| e.kind == "forced_cut").collect();
-        assert_eq!(forced.len(), 1, "強切要留且只留一筆事件：{events:?}");
-        assert!(forced[0].detail.contains("4000"), "事件要帶強切時間：{:?}", forced[0]);
+        assert_eq!(
+            events.iter().filter(|e| e.kind == "forced_cut").count(),
+            1,
+            "硬切恰一筆：{events:?}"
+        );
+        let cut = events
+            .iter()
+            .find(|e| e.kind == "forced_cut")
+            .expect("要有 forced_cut");
+        assert!(cut.detail.contains("16000"), "事件要帶上限：{:?}", cut);
         assert!(
-            !events.iter().any(|e| e.kind == "implicit_gap"),
-            "間隔都在 250 ms 內，不該有 implicit_gap：{events:?}"
+            cut.detail.contains("不可獨立回放"),
+            "事件要說明後果：{:?}",
+            cut
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.kind == "forced_cut_deferred")
+                .count(),
+            1,
+            "延後也只記一筆：{events:?}"
         );
         let _ = fs::remove_dir_all(&dir);
     }
