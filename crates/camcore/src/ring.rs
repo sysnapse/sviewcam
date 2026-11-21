@@ -443,8 +443,8 @@ mod tests {
         assert_eq!(rows[0].t_end, 4000);
         assert_eq!(rows[0].first_block_keyframe, Some(true));
         assert!(
-            rows[0].bytes > 1000,
-            "等待期間的 P 幀要留在同段：{:?}",
+            rows[0].bytes > 500,
+            "等待期間的 P 幀要留在同段（空段只有 SPS/PPS＋IDR 約 180 bytes）：{:?}",
             rows[0]
         );
         let events = w.index().events().unwrap();
