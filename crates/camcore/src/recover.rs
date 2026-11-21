@@ -105,6 +105,7 @@ pub fn recover(dir: &Path, index: &mut SegmentIndex) -> Result<RecoveryReport> {
                             t_end: info.t_end_ms,
                             bytes: end,
                             idr_offset: info.first_keyframe_offset.unwrap_or(0),
+                            first_block_keyframe: info.first_block_keyframe,
                             gap_ms,
                             closed: true,
                             repaired: true,
@@ -194,6 +195,7 @@ pub fn recover(dir: &Path, index: &mut SegmentIndex) -> Result<RecoveryReport> {
                         t_end: info.t_end_ms,
                         bytes: info.bytes,
                         idr_offset: info.first_keyframe_offset.unwrap_or(0),
+                        first_block_keyframe: info.first_block_keyframe,
                         gap_ms: None,
                         closed: info.is_closed(),
                         repaired: !info.is_closed(),
@@ -260,6 +262,7 @@ fn adopt_disk_orphans(
                     t_end: info.t_end_ms,
                     bytes: info.bytes,
                     idr_offset: info.first_keyframe_offset.unwrap_or(0),
+                    first_block_keyframe: info.first_block_keyframe,
                     // 沒有記錄可查 → 空窗長度未知，不猜 0
                     gap_ms: None,
                     closed: true,

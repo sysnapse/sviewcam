@@ -13,8 +13,13 @@ pub const HARD_MAX_WINDOW_MS: u64 = 15 * 60 * 1000;
 pub const DEFAULT_MAX_BYTES: u64 = 1_620_000_000;
 /// 單段長度：2 秒（GOP 對齊的切點單位）。
 pub const DEFAULT_SEGMENT_MS: u64 = 2_000;
-/// 非 GOP 對齊時的強切上限：4 秒。
+/// 等不到 IDR 時，進入「延後強切」的門檻：4 秒。
 pub const DEFAULT_FORCE_CUT_MS: u64 = 4_000;
+/// 延後強切的硬上限倍數：段長最多 `FORCE_CUT_LIMIT_FACTOR × force_cut_ms`。
+///
+/// 預設 4 → 單段硬上限 16 秒（自段首起算）。超過才退回「從非 keyframe 硬切」，
+/// 並把該段標成不可獨立回放。
+pub const FORCE_CUT_LIMIT_FACTOR: u64 = 4;
 /// 預配置單段檔案大小：8 MiB（2 s × 最高碼率仍留餘裕）。
 pub const DEFAULT_PREALLOC_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -118,7 +123,10 @@ pub struct RingConfig {
     pub dir: PathBuf,
     /// 段長（毫秒）。
     pub segment_ms: u64,
-    /// 非 GOP 對齊時的強切上限（毫秒）。
+    /// 等不到 IDR 時的延後強切門檻（毫秒）。
+    ///
+    /// 段滿 [`Self::segment_ms`] 後若仍無 IDR，等超過此值就進入延後期；段長硬上限
+    /// 另由 [`Self::force_cut_limit_ms`] 決定（預設 4×）。
     pub force_cut_ms: u64,
     /// 單段預配置 bytes。
     pub prealloc_bytes: u64,
@@ -149,6 +157,11 @@ impl RingConfig {
         let (retention, warnings) = RetentionConfig::from_minutes(minutes);
         self.retention = retention;
         (self, warnings)
+    }
+
+    /// 單段硬上限（自段首起算）：`FORCE_CUT_LIMIT_FACTOR × force_cut_ms`。
+    pub fn force_cut_limit_ms(&self) -> u64 {
+        self.force_cut_ms.saturating_mul(FORCE_CUT_LIMIT_FACTOR)
     }
 
     /// 索引檔路徑。
