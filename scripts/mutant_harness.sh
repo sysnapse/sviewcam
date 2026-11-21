@@ -17,11 +17,12 @@
 #   mutantD   空窗收口點退回 PLAY 200（N1 前的行為）→ 空窗量成 RST→PLAY 而非 RST→首個 RTP
 #   mutantE   每次 RST 都重開空窗（R8 前的行為，覆寫已開的空窗）→ 連續停機只量到最後一段
 #   mutantF   reconnects 遞增時機搬回握手（SVW-19 前的行為）→ 零 RTP 會話被記成已重連成功
+#   mutantG   延後強切的上限退回 force_cut（k24 前的立即硬切行為）→ 4000 ms 就切在 P 幀
 #
 # 只動 session.rs 一個檔案、一個缺陷一版，mutant 一律從 .bak 重建，結束還原並以 sha256 核對。
 # POSIX sh＋busybox 工具即可（devbox 的 rust 模板沒有 python3，也不得假設能裝套件）。
 #
-# 用法：  sh scripts/mutant_harness.sh              # good + 6 mutants
+# 用法：  sh scripts/mutant_harness.sh              # good + 7 mutants
 #         sh scripts/mutant_harness.sh naive        # 只跑指定 mutant
 # 結束碼：0 全部檢出；1 有 mutant 逃逸或 good 不綠；3 原始碼還原失敗；4 harness／注入／編譯錯誤。
 
@@ -34,20 +35,27 @@ cd "$(dirname "$0")/.."
 command -v cargo >/dev/null 2>&1 || PATH="/usr/local/cargo/bin:$PATH"
 export PATH
 SRC=crates/rtsp-core/src/session.rs
+SRC_RING=crates/camcore/src/ring.rs
 BAK=/tmp/mutant-harness.orig.rs
+BAK_RING=/tmp/mutant-harness.orig-ring.rs
 LOGS=/tmp/mutant-harness-logs
 TARGET=${1:-all}
 
 [ -f "$SRC" ] || { echo "找不到 $SRC（要在 repo 根跑）"; exit 4; }
+[ -f "$SRC_RING" ] || { echo "找不到 $SRC_RING（要在 repo 根跑）"; exit 4; }
 mkdir -p "$LOGS"
 cp "$SRC" "$BAK"
+cp "$SRC_RING" "$BAK_RING"
 SUM=$(sha256sum "$SRC" | cut -d' ' -f1)
+SUM_RING=$(sha256sum "$SRC_RING" | cut -d' ' -f1)
 
 restore() {
     cp "$BAK" "$SRC"
+    cp "$BAK_RING" "$SRC_RING"
     NOW=$(sha256sum "$SRC" | cut -d' ' -f1)
-    if [ "$NOW" != "$SUM" ]; then
-        echo "！！原始碼還原失敗：$SRC 已與跑之前的 sha256 不一致，請手動 git checkout"
+    NOW_RING=$(sha256sum "$SRC_RING" | cut -d' ' -f1)
+    if [ "$NOW" != "$SUM" ] || [ "$NOW_RING" != "$SUM_RING" ]; then
+        echo "！！原始碼還原失敗：session.rs 或 ring.rs 已與跑之前的 sha256 不一致，請手動 git checkout"
         exit 3
     fi
 }
@@ -80,6 +88,10 @@ anchor_check() {
         mutantE)
             N=$(grep -c '^        if gap_open_at.is_none() {$' "$BAK" || true)
             [ "$N" = 1 ] || { echo "錨點失效：mutantE 的「已開空窗不覆寫」有 $N 處（應為 1）"; exit 4; } ;;
+        mutantG)
+            # 延後強切的上限：正常是 4×force_cut，變異退回 force_cut＝立刻硬切。
+            N=$(grep -c 'let limit = self\.cfg\.force_cut_limit_ms();' "$BAK" || true)
+            [ "$N" = 1 ] || { echo "錨點失效：mutantG 的 force_cut_limit_ms 有 $N 處（應為 1）"; exit 4; } ;;
         mutantF)
             # 遞增時機的兩個錨點：握手成功的 `let session_is_reconnect = …` 與首個 RTP 分支的
             # `if session_is_reconnect {`（各自恰好一個）。
@@ -134,6 +146,14 @@ inject() {
             N=$(grep -c 'gap_open_at.take()' "$SRC" || true)
             [ "$N" = 2 ] || { echo "注入失敗：mutantD 應有 2 處 take（PLAY 與首個 RTP），實得 $N"; exit 4; }
             ;;
+        mutantG)
+            # k24 前的行為：上限等於 force_cut，段滿 force_cut 就立刻硬切在 P 幀。
+            subline "$BAK" 'let limit = self.cfg.force_cut_limit_ms();' \
+                'let limit = self.cfg.force_cut_ms;' > "$SRC"
+            N=$(grep -c 'let limit = self\.cfg\.force_cut_ms;' "$SRC" || true)
+            [ "$N" = 1 ] || { echo "注入失敗：mutantG 上限沒改成 force_cut（$N 處，應為 1）"; exit 4; }
+            M=$(grep -c 'force_cut_limit_ms()' "$SRC" || true)
+            [ "$M" = 0 ] || { echo "注入失敗：mutantG 仍呼叫 force_cut_limit_ms（$M 處）"; exit 4; } ;;
         mutantF)
             # SVW-19 前的行為：握手成功就 `rep.reconnects += 1`，首個 RTP 分支不再遞增。
             # 於是「PLAY 200 但永不送 RTP」的會話也被記成重連成功（零 RTP 情境 5 段連線得 4）。
@@ -172,6 +192,7 @@ require_of() {
         mutantD) echo 'replays_fixture_and_matches_declared_expectations|gap_is_measured_from_rst_to_first_rtp' ;;
         mutantE) echo 'midstream_rst_doubles_when_reconnect_gets_no_rtp' ;;
         mutantF) echo 'play_ok_without_any_rtp_records_no_gap_and_no_reconnected' ;;
+        mutantG) echo 'ring::tests::forced_cut_defers_until_idr_without_losing_frames' ;;
         good)    echo '' ;;
     esac
 }
@@ -180,13 +201,23 @@ require_of() {
 run_one() {
     NAME=$1
     LOG="$LOGS/$NAME.log"
+    case "$NAME" in
+        mutantG) SRC=crates/camcore/src/ring.rs; BAK=/tmp/mutant-harness.orig-ring.rs ;;
+        *)       SRC=crates/rtsp-core/src/session.rs; BAK=/tmp/mutant-harness.orig.rs ;;
+    esac
     inject "$NAME"
-    if ! cargo test -p rtsp-core --no-fail-fast >"$LOG" 2>&1; then
-        if grep -qE 'error\[E[0-9]+\]|error: could not compile|error: unexpected' "$LOG"; then
-            echo "  $NAME: COMPILE_ERROR（注入後編譯不過，不算檢出）— 見 $LOG"
-            HITS="$HITS $NAME:compile_error"
-            return
-        fi
+    if [ "$NAME" = good ]; then
+        { cargo test -p rtsp-core --no-fail-fast
+          cargo test -p camcore --lib --no-fail-fast; } >"$LOG" 2>&1 || true
+    elif [ "$NAME" = mutantG ]; then
+        cargo test -p camcore --lib 'ring::tests::forced_cut_defers_until_idr_without_losing_frames' --no-fail-fast >"$LOG" 2>&1 || true
+    else
+        cargo test -p rtsp-core --no-fail-fast >"$LOG" 2>&1 || true
+    fi
+    if grep -qE 'error\[E[0-9]+\]|error: could not compile|error: unexpected' "$LOG"; then
+        echo "  $NAME: COMPILE_ERROR（注入後編譯不過，不算檢出）— 見 $LOG"
+        HITS="$HITS $NAME:compile_error"
+        return
     fi
     if grep -q 'test result: FAILED' "$LOG"; then
         VERDICT=failed
@@ -227,7 +258,7 @@ echo "repo: $(pwd)"
 cargo --version
 
 if [ "$TARGET" = all ]; then
-    for m in good naive mutantA mutantB mutantC mutantD mutantE mutantF; do
+    for m in good naive mutantA mutantB mutantC mutantD mutantE mutantF mutantG; do
         echo "-- $m"
         run_one "$m"
     done

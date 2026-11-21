@@ -713,6 +713,139 @@ fn on_disk_segment_bytes(dir: &Path) -> u64 {
     total
 }
 
+// ---------------------------------------------------------------- AC6（k24）
+
+/// k24 AC6-1：GOP（6 s）> force_cut（4 s）時不得在 P 幀硬切；段邊界要落在 IDR，
+/// 新段首 block 必須是 keyframe，等待期間的 P 幀不得遺失。
+#[test]
+fn ac6_long_gop_waits_for_idr_instead_of_p_first_cut() {
+    let dir = data_dir("ac6-long-gop");
+    let out = run(&dir, "k24_long_gop", &["--retain-minutes", "15"]);
+    assert!(out.status.success(), "replay 失敗：{}", stderr_of(&out));
+
+    let index = camcore::SegmentIndex::open(dir.join("index.sqlite")).unwrap();
+    let rows = index.rows().unwrap();
+    let starts: Vec<u64> = rows.iter().map(|r| r.t_start).collect();
+    assert_eq!(
+        starts,
+        vec![1500, 7500, 13500, 19500],
+        "段邊界必須落在 6000 ms GOP 的 IDR 上（1500/7500/13500/19500）"
+    );
+    assert_eq!(rows.len(), 4);
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(
+            row.first_block_keyframe,
+            Some(true),
+            "第 {i} 段索引旗標必須是 true：{}",
+            row.name
+        );
+        let info = mkv::scan(&dir.join(&row.name)).unwrap();
+        println!(
+            "[ac6-long-gop] {} t_start={} t_end={} bytes={} first_block_keyframe={:?}",
+            row.name, row.t_start, row.t_end, row.bytes, info.first_block_keyframe
+        );
+        assert_eq!(
+            info.first_block_keyframe,
+            Some(true),
+            "{} 首個 SimpleBlock 必須是 keyframe（掃描器從檔案判定）",
+            row.name
+        );
+        assert!(info.is_closed());
+        assert!(row.bytes > 0);
+        if i + 1 < rows.len() {
+            assert_eq!(
+                rows[i + 1].t_start,
+                row.t_end,
+                "段之間不得有空隙或重疊：{}",
+                row.name
+            );
+        }
+    }
+    assert_eq!(
+        index.count_events("forced_cut").unwrap(),
+        0,
+        "這段 fixture 的 IDR 都在上限前到達，不該發生硬切"
+    );
+    assert_eq!(
+        index.count_events("forced_cut_deferred").unwrap(),
+        3,
+        "三段（1500/7500/13500）都應先延後強切等 IDR 各一次"
+    );
+    assert_eq!(index.count_events("implicit_gap").unwrap(), 0);
+
+    // 等待期間的 P 幀確實留在第一段：不是只留 SPS/PPS＋IDR 的空殼。
+    assert!(
+        rows[0].bytes > 1_000,
+        "第一段只有 {} bytes，等待期間的 P 幀疑似被丟掉",
+        rows[0].bytes
+    );
+}
+
+/// k24 AC6-2：一直等不到 IDR 時，到 4×force_cut（16 s）硬上限才硬切，
+/// 新段如實標成不可獨立回放（索引與掃描器兩路一致），且每個後續段重新等 IDR。
+#[test]
+fn ac6_no_idr_falls_back_at_hard_limit_and_flags_unplayable_segment() {
+    let dir = data_dir("ac6-no-idr");
+    let out = run(&dir, "k24_no_idr", &["--retain-minutes", "15"]);
+    assert!(out.status.success(), "replay 失敗：{}", stderr_of(&out));
+
+    let index = camcore::SegmentIndex::open(dir.join("index.sqlite")).unwrap();
+    let rows = index.rows().unwrap();
+    let starts: Vec<u64> = rows.iter().map(|r| r.t_start).collect();
+    assert_eq!(
+        starts,
+        vec![1500, 17500, 33500],
+        "硬上限＝段首起算 16000 ms：1500→17500→33500"
+    );
+    assert_eq!(rows[0].first_block_keyframe, Some(true), "第一段從 IDR 開始");
+    assert_eq!(
+        rows[1].first_block_keyframe,
+        Some(false),
+        "上限硬切後的新段從 P 幀開始，索引不得謊報 true"
+    );
+    assert_eq!(rows[2].first_block_keyframe, Some(false));
+
+    for (i, row) in rows.iter().enumerate() {
+        let info = mkv::scan(&dir.join(&row.name)).unwrap();
+        println!(
+            "[ac6-no-idr] {} t_start={} t_end={} bytes={} first_block_keyframe={:?}",
+            row.name, row.t_start, row.t_end, row.bytes, info.first_block_keyframe
+        );
+        assert_eq!(
+            info.first_block_keyframe, row.first_block_keyframe,
+            "{} 索引旗標與掃描器不一致",
+            row.name
+        );
+        if i + 1 < rows.len() {
+            assert_eq!(rows[i + 1].t_start, row.t_end, "硬切後續段要接續時間軸");
+        }
+    }
+    assert_eq!(
+        index.count_events("forced_cut").unwrap(),
+        2,
+        "兩次到達硬上限各一筆硬切事件"
+    );
+    let hard_cuts: Vec<camcore::index::EventRow> = index
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "forced_cut")
+        .collect();
+    for e in &hard_cuts {
+        assert!(
+            e.detail.contains("不可獨立回放"),
+            "硬切事件要寫清楚後果：{}",
+            e.detail
+        );
+        assert!(e.detail.contains("16000"), "事件要帶上限值：{}", e.detail);
+    }
+    assert_eq!(
+        index.count_events("forced_cut_deferred").unwrap(),
+        3,
+        "三個段（含最後未達上限的段）都先延後等 IDR"
+    );
+}
+
 // ---------------------------------------------------------------- AC5
 
 #[test]
