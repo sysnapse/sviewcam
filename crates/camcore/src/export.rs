@@ -151,6 +151,10 @@ pub fn export(
             range.from_ms, range.to_ms
         )));
     }
+    // CP2 紅燈：先在骨架階段明確失敗，讓 AC3 測試在 CI 上紅；下一個 commit 實作。
+    let _ = (dir, index, output, options);
+    return Err(Error::Export("尚未實作（CP2 紅燈）".into()));
+    #[allow(unreachable_code)]
     check_ffmpeg(&options.ffmpeg)?;
 
     let all: Vec<SegmentRow> = index
