@@ -112,11 +112,12 @@ fn k18_ac2_short_session_fps_is_null() {
 fn k18_ac3_reconnect_uses_window_with_most_frames() {
     let json = run_report("k18_reconnect");
     let fps = &json["fps"];
-    assert!(
-        fps.is_object(),
-        "重連後應仍有有效 fps 物件：{json:#}"
+    assert!(fps.is_object(), "重連後應仍有有效 fps 物件：{json:#}");
+    assert_eq!(
+        fps["frames"].as_u64(),
+        Some(250),
+        "應取 250 幀那個窗：{fps:#}"
     );
-    assert_eq!(fps["frames"].as_u64(), Some(250), "應取 250 幀那個窗：{fps:#}");
     assert_eq!(fps["first_timestamp"].as_u64(), Some(315_000));
     assert_eq!(fps["last_timestamp"].as_u64(), Some(1_211_400));
     assert_eq!(fps["median_fps"].as_f64(), Some(25.0));
