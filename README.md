@@ -9,7 +9,8 @@ Rust 桌面客戶端（目標：接 WiFi 相機、看即時串流、截圖、抓
 |---|---|---|
 | M0 | `rtsp-core` ＋ `tools/probe` ＋ `tools/replay` ＋ 合成 fixture | in-dev（fixture 標準 1–2 已可驗；真機標準 3–5 待相機測試窗） |
 | M1 | `camcore` 磁碟環形緩衝 ＋ SQLite 索引 ＋ 啟動復原 | in-dev（AC1–AC4 已綠；AC5 為 `#[ignore]` 手動跑） |
-| M2–M5 | 匯出、camd 常駐、egui GUI、杰理骨架 | ticket draft |
+| M2 | `camcore::export`／`snapshot` ＋ `tools/camctl`（無損 MP4、跨 gap 分檔、回溯截圖） | in-dev（管線證據；真機證據待 k10） |
+| M3–M5 | camd 常駐、egui GUI、杰理骨架 | ticket draft |
 
 ## 目標架構（v3 規劃）
 
@@ -66,6 +67,57 @@ cargo run -p replay -- --input fixtures/m1/ac1_six_min.jsonl \
 - **段首 IDR**：`mkv::scan()` 直接讀檔案第一個 SimpleBlock 的 flags 判定 `first_block_keyframe`，驗收測試用它證明段首可獨立解碼，不靠寫入器自己的欄位。
 - **防呆補記**：相鄰 NAL 相隔超過 250 ms 卻沒收到 gap 事件時，仍關段並記 `implicit_gap` 事件（有記錄的補記，不是靜默）。
 - **合成串流**：fixture 的 `{"type":"synth_stream"}` 在重放時確定性合成 RTP（同一 fixture 每次位元組相同），走既有 `rtp::build` + FU-A 路徑，不需要把 GB 級 base64 塞進 JSONL。
+
+## M2：片段匯出與回溯截圖（camctl）
+
+`camctl` 把 M1 的段檔轉成可播放的 MP4，或從指定時間點截一張 JPEG。匯出**不重編碼**
+（`-c copy`），只做無損轉封裝；時間一律是 host 單調時鐘毫秒。
+
+**需求**：`ffmpeg` 與 `ffprobe` 必須在 `PATH`，版本 ≥ 4.4（`camctl` 會先跑 `ffmpeg -version`，
+太舊或缺失會明確報錯，不會靜默退回別的二進位）。CI 一律用 ubuntu-latest 的系統 ffmpeg；
+arm64 devbox 可用 `fixtures/m2/fetch_ffmpeg.sh` 下載釘死版本的靜態檔到 `.tools/ffmpeg/`
+（URL 與 sha256 在腳本內，版本 7.0.2；`.tools/` 不進 git）。
+
+```sh
+# 匯出「最後 3 分鐘到最後 1 分鐘」；相對時間的 anchor 是最後一段的 t_end
+cargo run -p camctl -- export --dir /tmp/rec --from -3m --to -1m -o /tmp/clip.mp4 --json
+
+# 截「最後 90 秒」那一點；--at 也是相對 anchor
+cargo run -p camctl -- snapshot --dir /tmp/rec --at -90s -o /tmp/snap.jpg --json
+```
+
+- **相對時間**：`-3m`、`-90s`、`-1h`、`0`；`0` 代表 anchor 本身。anchor 是索引內**最後一段的
+  `t_end`**（不是 wall clock），所以錄影停止後仍可重現。範圍被保留窗 trim 掉時，錯誤訊息會
+  帶出目前可用的最早／最晚段，不會默默給出短一半的檔。
+- **跨 gap**：相鄰段的 `gap_ms` 大於 0，或兩段邊界不連續且 gap 未知時，輸出會分檔成
+  `out.1.mp4`、`out.2.mp4`…，並在 stderr 印出 gap 時點；**不會**把空窗接成連續畫面。
+  已知 gap 印 `gap 2000 ms at t=…`；未知 gap 印 `gap 未知（段邊界差 2000 ms）；不靜默拼接`，
+  不會把推測值寫成確定值。`--json` 的 `outputs[]` 每檔有 `t_start_ms`／`t_end_ms`，
+  `gaps[]` 有 `at_ms`、`gap_ms`（`null`＝未知）。**`--json` 只改 stdout；gap 與警告一律照樣走 stderr。**
+- **段落對齊與 4 秒上界**：匯出只選完整段，起點是段首 IDR，所以正常 2 秒段下輸出最多比請求
+  早／晚一個段長（<4 秒）。k24 的硬切段最長 16 秒（P-first），這時 4 秒上界**不成立**；程式
+  不裁半個 GOP，而是照樣輸出整段，並在 `outputs[]` 給 `padded_before_ms`／`padded_after_ms`
+  （實際輸出與請求範圍的差），padding >4000 ms 時 stderr 印警告。
+- **P-first 段是終止符，不是成員**：一個輸出只從 `first_block_keyframe=true` 的段開始，往後
+  串連續且可獨立解碼的段；碰到 P-first 段就結束這個 run，剩下的範圍另起新 run（必須從下一個
+  kf 段開始）。被排除的段會明示：stderr 印
+  `注意：N 個段因不可獨立解碼被排除（時間軸不連續）：…`，JSON 的 `excluded_segments[]`
+  有 `id` 與 `reason`。不併入不是時間戳問題——P-first 段檔開頭沒有 SPS/PPS，ffmpeg 連讀都
+  讀不開，併進來只會得到定格／時戳錯亂但 `-v error` 不一定報錯的檔。
+  若請求範圍的起點落在 P-first 段，會跳過它、從範圍內下一個 kf 段開始（列進
+  `excluded_segments[]`）；**只要範圍內至少還有一個可獨立解碼的段就輸出、rc=0**，
+  只有整個範圍連一個 kf 段都沒有才 rc=2。被排除段造成的時間軸洞只記在
+  `excluded_segments[]`，不記進 `gaps[]`（`gaps[]` 只表示索引已知的空窗）。
+- **snapshot 的「IDR 對齊」**：解碼起點對齊所屬段的段首 IDR（段檔第一幀），再輸出 `at`
+  最近的那個顯示幀；不是把 JPEG 本身壓成 IDR。因此時間誤差是「最近顯示幀」等級（25 fps
+  約 40 ms，門檻 500 ms）。`--json` 的 `snapshot` 會帶 `actual_ms`（從 ffmpeg `showinfo`
+  的 `pts_time` 解析，不是讀 stdout 的人話）與 `segment_idr_at_ms`（所屬段段首 IDR 時間）。
+- **exit code**：`0` 成功（含跨 gap 分檔；範圍內只要還有一個可獨立解碼的段就成功）、
+  `2` 參數／環境／範圍不可得／範圍內完全沒有可獨立解碼的段、`130` 收到 SIGINT
+  （會殺掉 ffmpeg child 並清掉 `.k14-*` 暫存，不留半成品）。
+- **管線證據免責**：CI 的 AC 是先用 ffmpeg 現生一段合成的 2560×1440 H.264，餵進既有錄影
+  路徑得到真段檔，再驗 export／snapshot。這證明的是「管線可處理 1440p」，**不是** SView
+  相機真機錄影；真機證據另案（k10）。測試腳本在 `fixtures/m2/gen_1440p.sh`。
 
 ## 故障注入 harness（重連鑑別力）
 
