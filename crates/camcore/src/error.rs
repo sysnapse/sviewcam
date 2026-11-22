@@ -13,6 +13,9 @@ pub enum Error {
 
     #[error("config: {0}")]
     Config(String),
+
+    #[error("export: {0}")]
+    Export(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
