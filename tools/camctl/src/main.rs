@@ -261,3 +261,26 @@ fn fail(message: &str) -> ExitCode {
     eprintln!("錯誤：{message}");
     ExitCode::from(2)
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::parse_offset;
+
+    #[test]
+    fn parses_negative_relative_times() {
+        assert_eq!(parse_offset("-90s"), Ok(90_000));
+        assert_eq!(parse_offset("-3m"), Ok(180_000));
+        assert_eq!(parse_offset("-1h"), Ok(3_600_000));
+        assert_eq!(parse_offset("0"), Ok(0));
+        assert_eq!(parse_offset("-0"), Ok(0));
+    }
+
+    #[test]
+    fn rejects_positive_and_bad_units() {
+        assert!(parse_offset("3m").is_err());
+        assert!(parse_offset("-3d").is_err());
+        assert!(parse_offset("--3m").is_err());
+        assert!(parse_offset("-").is_err());
+    }
+}

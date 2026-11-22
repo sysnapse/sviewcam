@@ -491,3 +491,80 @@ fn ms_to_relative(ms: u64, anchor: u64) -> String {
         format!("+{:.1}s", (ms - anchor) as f64 / 1000.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(name: &str, t_start: u64, t_end: u64, gap_ms: Option<u64>) -> SegmentRow {
+        SegmentRow {
+            segment_id: name.trim_end_matches(".mkv").to_string(),
+            name: name.to_string(),
+            t_start,
+            t_end,
+            bytes: 1,
+            idr_offset: 0,
+            first_block_keyframe: Some(true),
+            gap_ms,
+            closed: true,
+            repaired: false,
+        }
+    }
+
+    fn kind(prev: &SegmentRow, next: &SegmentRow) -> GapKind {
+        classify_gap(prev, next)
+    }
+
+    #[test]
+    fn gap_some_zero_with_equal_boundary_is_continuous() {
+        let a = row("seg-000000000000.mkv", 0, 2_000, Some(0));
+        let b = row("seg-000000002000.mkv", 2_000, 4_000, Some(0));
+        assert!(matches!(kind(&a, &b), GapKind::Continuous));
+    }
+
+    #[test]
+    fn gap_some_zero_with_broken_boundary_is_split() {
+        let a = row("seg-000000000000.mkv", 0, 2_000, Some(0));
+        let b = row("seg-000000002500.mkv", 2_500, 4_500, Some(0));
+        match kind(&a, &b) {
+            GapKind::Gap { gap_ms, detail } => {
+                assert_eq!(gap_ms, Some(500));
+                assert!(detail.contains("500"));
+            }
+            _ => panic!("必須分檔"),
+        }
+    }
+
+    #[test]
+    fn gap_some_n_is_split_and_preserves_declared_value() {
+        let a = row("seg-000000000000.mkv", 0, 2_000, Some(0));
+        let b = row("seg-000000002500.mkv", 2_500, 4_500, Some(500));
+        match kind(&a, &b) {
+            GapKind::Gap { gap_ms, detail } => {
+                assert_eq!(gap_ms, Some(500));
+                assert!(!detail.contains("但段邊界差"));
+            }
+            _ => panic!("必須分檔"),
+        }
+    }
+
+    #[test]
+    fn gap_unknown_with_nonzero_delta_is_not_silently_joined() {
+        let a = row("seg-000000000000.mkv", 0, 2_000, Some(0));
+        let b = row("seg-000000002500.mkv", 2_500, 4_500, None);
+        match kind(&a, &b) {
+            GapKind::Gap { gap_ms, detail } => {
+                assert_eq!(gap_ms, Some(500));
+                assert!(detail.contains("未知"));
+            }
+            _ => panic!("未知 gap 必須分檔"),
+        }
+    }
+
+    #[test]
+    fn overlapping_boundary_is_split_not_joined() {
+        let a = row("seg-000000000000.mkv", 0, 3_000, Some(0));
+        let b = row("seg-000000002000.mkv", 2_000, 4_000, Some(0));
+        assert!(matches!(kind(&a, &b), GapKind::Gap { .. }));
+    }
+}
