@@ -409,4 +409,42 @@ mod tests {
         assert_eq!(stats.mean_fps, 25.0);
         assert_eq!(stats.median_fps, 25.0);
     }
+
+    #[test]
+    fn fewer_than_min_frames_yields_no_fps() {
+        let mut est = FpsEstimator::new();
+        // 29 幀：差一個才到 MIN_FRAMES，整窗應被丟棄，回 None（不是 0、不是 NaN）。
+        feed_constant(&mut est, TS0, 29);
+        assert!(est.finish().is_none(), "少於 30 幀不得產生 fps");
+    }
+
+    #[test]
+    fn single_timestamp_yields_no_fps() {
+        let mut est = FpsEstimator::new();
+        est.push(TS0, true);
+        assert!(est.finish().is_none(), "只有一個 timestamp 不得產生 fps");
+    }
+
+    #[test]
+    fn reconnect_keeps_window_with_most_frames_and_resets_baseline() {
+        // 第一個窗 250 幀，第二個 100 幀：保留第一個。
+        let mut est = FpsEstimator::new();
+        feed_constant(&mut est, TS0, 250);
+        est.session_boundary();
+        feed_constant(&mut est, TS0.wrapping_add(1_000_000), 100);
+        let first = est.finish().expect("應保留第一個窗");
+        assert_eq!(first.frames, 250);
+        assert_eq!(first.first_timestamp, TS0);
+
+        // 第一個窗 100 幀，第二個 250 幀：取第二個，且基準是第二個的 timestamp。
+        let mut est = FpsEstimator::new();
+        feed_constant(&mut est, TS0, 100);
+        est.session_boundary();
+        let second_start = TS0.wrapping_add(900_000);
+        feed_constant(&mut est, second_start, 250);
+        let second = est.finish().expect("應保留第二個窗");
+        assert_eq!(second.frames, 250);
+        assert_eq!(second.first_timestamp, second_start);
+        assert_eq!(second.median_fps, 25.0);
+    }
 }

@@ -90,3 +90,40 @@ fn k18_ac1_timestamp_fps_is_exactly_25() {
         "fixture 的 marker 多於幀數，mismatch 應 >0：{fps:#}"
     );
 }
+
+/// 短 session：不足 MIN_FRAMES（30 幀）時不得給出 fps。
+/// 19 幀的 timestamp 差仍然可算出 25，但樣本不足，正確行為是 `fps: null`，
+/// 不能回 0、NaN，也不能 panic。
+#[test]
+fn k18_ac2_short_session_fps_is_null() {
+    let json = run_report("k18_short");
+    assert!(
+        json["fps"].is_null(),
+        "少於 30 幀的 session 必須回 fps=null：{json:#}"
+    );
+    let text = json.to_string();
+    assert!(!text.contains("NaN"), "報告不得出現 NaN：{text}");
+    assert!(!text.contains("inf"), "報告不得出現 inf：{text}");
+}
+
+/// 重連：第一個 session 40 幀、第二個 250 幀，結果必須取第二個（幀數最多），
+/// 且 first_timestamp 必須是第二個 session 的基準，不得沿用第一個 session 的 135000。
+#[test]
+fn k18_ac3_reconnect_uses_window_with_most_frames() {
+    let json = run_report("k18_reconnect");
+    let fps = &json["fps"];
+    assert!(
+        fps.is_object(),
+        "重連後應仍有有效 fps 物件：{json:#}"
+    );
+    assert_eq!(fps["frames"].as_u64(), Some(250), "應取 250 幀那個窗：{fps:#}");
+    assert_eq!(fps["first_timestamp"].as_u64(), Some(315_000));
+    assert_eq!(fps["last_timestamp"].as_u64(), Some(1_211_400));
+    assert_eq!(fps["median_fps"].as_f64(), Some(25.0));
+    assert_eq!(fps["mean_fps"].as_f64(), Some(25.0));
+    assert_ne!(
+        fps["first_timestamp"].as_u64(),
+        Some(135_000),
+        "第一個 session 的 timestamp 基線不得污染結果：{fps:#}"
+    );
+}
