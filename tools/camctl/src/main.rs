@@ -105,7 +105,7 @@ fn main() -> ExitCode {
     let flag = Arc::new(AtomicBool::new(false));
     let _ = CANCEL_FLAG.set(flag.clone());
     unsafe {
-        libc::signal(libc::SIGINT, on_sigint as libc::sighandler_t);
+        libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
     }
 
     let cli = Cli::parse();
