@@ -1,0 +1,16 @@
+[package]
+name = "camctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SViewCam 片段匯出與截圖 CLI（M2）"
+
+[[bin]]
+name = "camctl"
+path = "src/main.rs"
+
+[dependencies]
+camcore = { path = "../../crates/camcore" }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde_json = "1"
