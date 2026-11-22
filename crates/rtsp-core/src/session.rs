@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use crate::clock::Clock;
 use crate::error::{Error, Result};
+use crate::fps::{FpsEstimator, FpsStats};
 use crate::link::{Link, LinkFactory};
 use crate::rtp::{self, Depacketizer};
 use crate::rtsp;
@@ -158,6 +159,8 @@ pub struct Report {
     pub gaps: Vec<StreamGap>,
     pub max_gap_ms: u64,
     pub bitrate_bps: f64,
+    /// 由 RTP timestamp 標定的真實幀率（BACKLOG-02）。`None`＝樣本不足或沒有視訊。
+    pub fps: Option<FpsStats>,
     pub finished: String,
     pub errors: Vec<String>,
     pub sprop_sets: usize,
@@ -191,6 +194,7 @@ impl Report {
             gaps: Vec::new(),
             max_gap_ms: 0,
             bitrate_bps: 0.0,
+            fps: None,
             finished: String::new(),
             errors: Vec::new(),
             sprop_sets: 0,
@@ -274,6 +278,7 @@ pub async fn run(
     let t0 = clock.now_ms();
     let mut rep = Report::new(&cfg.uri);
     let mut depack = Depacketizer::new();
+    let mut fps = FpsEstimator::new();
     let mut attempt: u32 = 0;
     let mut backoff = cfg.reconnect.initial;
     let mut gap_open_at: Option<u64> = None;
@@ -340,6 +345,8 @@ pub async fn run(
         };
 
         rep.connects += 1;
+        // RTP timestamp 基準每個 session 可能重來；先收掉上一段窗，已完成的樣本保留。
+        fps.session_boundary();
         // SVW-19（N1）：reconnects 的語義是「斷流後**成功續流**的重連」，不是「握手成功」。
         // 相機會在 PLAY 200 之後直接 RST、或乾脆不送流；若在握手成功時就遞增，這些從未收到
         // 任何 RTP 的會話會被誤記成已重連成功（零 RTP 情境實測 5 段連線得 reconnects=4）。
@@ -465,6 +472,7 @@ pub async fn run(
                             }
 
                             if p.payload_type == 96 {
+                                fps.push(p.timestamp, p.marker);
                                 match depack.push(p.payload, p.timestamp) {
                                     Ok(nals) => {
                                         for nal in nals {
@@ -603,6 +611,7 @@ pub async fn run(
     }
 
     rep.incomplete_frames = depack.incomplete;
+    rep.fps = fps.finish();
     rep.duration_ms = clock.now_ms().saturating_sub(t0);
     if rep.duration_ms > 0 {
         rep.bitrate_bps = (rep.rtp_bytes as f64 * 8.0) / (rep.duration_ms as f64 / 1000.0);

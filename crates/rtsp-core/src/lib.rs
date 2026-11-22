@@ -12,6 +12,7 @@
 
 pub mod clock;
 pub mod error;
+pub mod fps;
 pub mod link;
 pub mod mock;
 pub mod replay;
@@ -23,6 +24,7 @@ pub mod sink;
 
 pub use clock::{Clock, RealClock, VirtualClock};
 pub use error::{Error, Result};
+pub use fps::{FpsEstimator, FpsStats};
 pub use link::{Link, LinkFactory};
 pub use replay::{ReplayFactory, ReplayFixture, SynthSpec};
 pub use rtsp::USER_AGENT;
