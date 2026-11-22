@@ -149,8 +149,7 @@ impl FpsEstimator {
         self.intervals.push(u64::from(d));
         self.last_ts = Some(timestamp);
 
-        if self.unwrapped >= TARGET_WINDOW_MS * (RTP_CLOCK_HZ / 1000)
-            || self.frames() >= MAX_FRAMES
+        if self.unwrapped >= TARGET_WINDOW_MS * (RTP_CLOCK_HZ / 1000) || self.frames() >= MAX_FRAMES
         {
             self.finish_current();
             self.window_done = true;
@@ -194,10 +193,7 @@ impl FpsEstimator {
         }
 
         let stats = self.build_stats(first);
-        let replace = self
-            .best
-            .as_ref()
-            .map_or(true, |b| stats.frames > b.frames);
+        let replace = self.best.as_ref().map_or(true, |b| stats.frames > b.frames);
         if replace {
             self.best = Some(stats);
         }
@@ -241,10 +237,8 @@ impl FpsEstimator {
         let median_interval_ms = median_ticks / (RTP_CLOCK_HZ as f64 / 1000.0);
         let p05 = percentile_ms(&sorted, 0.05);
         let p95 = percentile_ms(&sorted, 0.95);
-        let min = sorted.first().map(|v| *v as f64).unwrap_or(0.0)
-            / (RTP_CLOCK_HZ as f64 / 1000.0);
-        let max = sorted.last().map(|v| *v as f64).unwrap_or(0.0)
-            / (RTP_CLOCK_HZ as f64 / 1000.0);
+        let min = sorted.first().map(|v| *v as f64).unwrap_or(0.0) / (RTP_CLOCK_HZ as f64 / 1000.0);
+        let max = sorted.last().map(|v| *v as f64).unwrap_or(0.0) / (RTP_CLOCK_HZ as f64 / 1000.0);
         let variable = p95 - p05 > 0.10 * median_interval_ms;
 
         FpsStats {

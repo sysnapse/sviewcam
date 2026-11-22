@@ -62,13 +62,25 @@ fn k18_ac1_timestamp_fps_is_exactly_25() {
     assert_eq!(fps["last_timestamp"].as_u64(), Some(1_031_400));
 
     // 精度：恰好 25.000（f64 可精確表示 25）。
-    assert_eq!(fps["mean_fps"].as_f64(), Some(25.0), "mean 必須恰好 25.000：{fps:#}");
-    assert_eq!(fps["median_fps"].as_f64(), Some(25.0), "median 必須恰好 25.000：{fps:#}");
+    assert_eq!(
+        fps["mean_fps"].as_f64(),
+        Some(25.0),
+        "mean 必須恰好 25.000：{fps:#}"
+    );
+    assert_eq!(
+        fps["median_fps"].as_f64(),
+        Some(25.0),
+        "median 必須恰好 25.000：{fps:#}"
+    );
     assert_eq!(fps["mean_interval_ms"].as_f64(), Some(40.0));
     assert_eq!(fps["median_interval_ms"].as_f64(), Some(40.0));
     assert_eq!(fps["min_interval_ms"].as_f64(), Some(40.0));
     assert_eq!(fps["max_interval_ms"].as_f64(), Some(40.0));
-    assert_eq!(fps["variable"].as_bool(), Some(false), "這個 fixture 是 CFR：{fps:#}");
+    assert_eq!(
+        fps["variable"].as_bool(),
+        Some(false),
+        "這個 fixture 是 CFR：{fps:#}"
+    );
     assert_eq!(fps["default_duration_ns"].as_u64(), Some(40_000_000));
 
     // marker 只做一致性檢查：合成器每個 RTP 封包都設 marker（含 SPS/PPS），
