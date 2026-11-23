@@ -144,3 +144,35 @@ fn missing_socket_exits_two_and_prints_resolved_path() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// B1：`list-segments` 的人類輸出要印真的數字，不是 `null`。
+///
+/// 協議回的是 `t_start_ms`／`t_end_ms`（`--json` 原樣轉出）；人類可讀那行以前讀的是
+/// `t_start`／`t_end`，所以永遠印 `null`。這裡用假 camd 直接驗 stderr 的兩個欄位。
+#[test]
+fn list_segments_human_output_prints_real_timestamps() {
+    let dir = unique_dir("human");
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("camd.sock");
+    const LIST_REPLY: &str = r#"{"id":1,"result":{"segments":[{"segment_id":"seg-000000001500","name":"seg-000000001500.mkv","t_start_ms":1500,"t_end_ms":3500,"bytes":125796,"first_block_keyframe":true,"gap_ms":0}],"count":1,"total":1}}"#;
+    let server = fake_server(&socket, LIST_REPLY);
+
+    let (code, _stdout, stderr) = run(Command::new(camctl_bin())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("list-segments")
+        .arg("--limit")
+        .arg("5"));
+    server.join().unwrap();
+
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stderr.contains("t_start=1500") && stderr.contains("t_end=3500"),
+        "人類輸出必須印出實際的 t_start_ms／t_end_ms：{stderr}"
+    );
+    assert!(
+        !stderr.contains("t_start=null") && !stderr.contains("t_end=null"),
+        "人類輸出不得是 null：{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

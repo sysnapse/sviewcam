@@ -324,8 +324,8 @@ fn run_list_segments(args: ListSegmentsArgs) -> ExitCode {
             "{} name={} t_start={} t_end={} bytes={} first_block_keyframe={} gap_ms={}",
             row["segment_id"].as_str().unwrap_or("?"),
             row["name"].as_str().unwrap_or("?"),
-            row["t_start"],
-            row["t_end"],
+            row["t_start_ms"],
+            row["t_end_ms"],
             row["bytes"],
             row["first_block_keyframe"],
             row["gap_ms"]

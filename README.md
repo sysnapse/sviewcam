@@ -229,7 +229,7 @@ harness 在驗收環境跑不起來；`fixtures/gen_sview_m0.py`（重生 fixtur
 | method | params | 說明 |
 |---|---|---|
 | `status` | — | `camd{version,pid,uptime_ms,socket,data_dir}`、`camera{state,last_frame_uptime_ms,reconnects,next_retry_ms,last_error}`、`recording{current_segment,segments,total_bytes,latest_end_ms,last_error}`、`fps` |
-| `list_segments` | `from`／`to`（可選，串流毫秒）、`limit`（1–1000，預設 100） | 最近 `limit` 筆，回 `segment_id/name/t_start/t_end/bytes/first_block_keyframe/gap_ms` |
+| `list_segments` | `from`／`to`（可選，串流毫秒）、`limit`（1–1000，預設 100） | 最近 `limit` 筆，回 `segment_id/name/t_start_ms/t_end_ms/bytes/first_block_keyframe/gap_ms`（`segment_id` 不含副檔名，`name` 是磁碟檔名） |
 | `ping` | — | `{pong,uptime_ms,proto_version}` |
 
 **時間基準只有一個**：索引的 `t_start`／`t_end`（串流毫秒）。`uptime_ms` 是 host 時間，

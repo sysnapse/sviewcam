@@ -284,22 +284,27 @@ fn current_segment(dir: &std::path::Path) -> Value {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Value::Null;
     };
-    let mut newest: Option<(String, u64)> = None;
+    let mut newest: Option<(String, String, u64)> = None;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         if !name.ends_with(".mkv.part") {
             continue;
         }
-        let segment_id = name.trim_end_matches(".part").to_string();
-        let t_start = camcore::recover::parse_t_start(&segment_id).unwrap_or(0);
-        if newest.as_ref().map_or(true, |(_, best)| t_start >= *best) {
-            newest = Some((segment_id, t_start));
+        // segment_id 一律是不含副檔名的 id（與 list_segments 的 rows 同一個值）；
+        // name 才是磁碟上的真實檔名（`.mkv.part`）。
+        let segment_id = name.trim_end_matches(".mkv.part").to_string();
+        let t_start = camcore::recover::parse_t_start(&name).unwrap_or(0);
+        if newest
+            .as_ref()
+            .map_or(true, |(_, _, best)| t_start >= *best)
+        {
+            newest = Some((segment_id, name, t_start));
         }
     }
     match newest {
-        Some((segment_id, t_start)) => json!({
+        Some((segment_id, name_on_disk, t_start)) => json!({
             "segment_id": segment_id,
-            "name": format!("{segment_id}.mkv.part"),
+            "name": name_on_disk,
             "t_start_ms": t_start,
         }),
         None => Value::Null,
@@ -330,10 +335,15 @@ pub async fn run(opts: Options) -> Result<(), StartupError> {
         camipc::resolve_socket(opts.socket.as_deref()).map_err(StartupError::config)?;
 
     if let Some(parent) = socket_path.parent() {
+        // 只有「這次自己新建」的目錄才設 0700。已存在的父目錄（例如 `--socket /tmp/camd.sock`
+        // 的 `/tmp`）一個位元都不動：改它的權限會影響整台機器上所有使用者。
+        let existed = parent.exists();
         std::fs::create_dir_all(parent).map_err(|e| {
             StartupError::config(format!("建立 socket 目錄 {} 失敗：{e}", parent.display()))
         })?;
-        set_private_dir(parent)?;
+        if !existed {
+            set_private_dir(parent)?;
+        }
     }
 
     let lock_path = socket_path.with_file_name(lock::LOCK_FILE_NAME);

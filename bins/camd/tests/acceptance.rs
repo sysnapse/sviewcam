@@ -519,3 +519,121 @@ fn no_camera_keeps_daemon_alive_and_reports_disconnected() {
     assert!(daemon.alive(), "相機連不上時 camd 必須繼續存活（退避重試）");
     cleanup(&dir);
 }
+
+fn call(socket: &Path, method: &str, params: Value) -> Value {
+    let mut client = Client::connect(socket).unwrap_or_else(|e| panic!("連 camd 失敗：{e}"));
+    camipc::client::into_result(client.call(method, params).unwrap())
+        .unwrap_or_else(|e| panic!("{method} 失敗：{e:?}"))
+}
+
+/// B2：`status.current_segment` 的 `segment_id` 不含副檔名，`name` 是磁碟上真的檔名。
+#[test]
+fn current_segment_id_and_name_match_the_closed_row() {
+    let dir = unique_dir("curseg");
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("camd.sock");
+    let replay = Replay::start(&dir);
+    let mut daemon = Daemon::start(&dir, &socket, &replay.uri());
+
+    // 錄到第一段閉合、第二段正在寫，才會有 non-null current_segment。
+    wait_segments(&socket, 1, TEST_BUDGET);
+    let mut current = Value::Null;
+    let deadline = Instant::now() + TEST_BUDGET;
+    while Instant::now() < deadline {
+        let status = status(&socket);
+        let seg = status["recording"]["current_segment"].clone();
+        if seg.is_object() {
+            current = seg;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        current.is_object(),
+        "錄影中 status.current_segment 必須有值：{current}"
+    );
+    let segment_id = current["segment_id"].as_str().expect("segment_id");
+    let name = current["name"].as_str().expect("name");
+    let t_start = current["t_start_ms"].as_u64().expect("t_start_ms");
+
+    assert!(
+        !segment_id.ends_with(".mkv") && !segment_id.ends_with(".part"),
+        "segment_id 不得帶副檔名：{segment_id}"
+    );
+    assert_eq!(
+        name,
+        format!("{segment_id}.mkv.part"),
+        "name 必須是磁碟上的真實檔名"
+    );
+    assert!(
+        dir.join(name).is_file(),
+        "status 回報的 name 必須真的存在：{}",
+        dir.join(name).display()
+    );
+
+    // 等這一段閉合，索引裡的 id 必須與剛才的 segment_id 相同。
+    let deadline = Instant::now() + TEST_BUDGET;
+    let mut row = Value::Null;
+    while Instant::now() < deadline {
+        let listed = call(&socket, "list_segments", serde_json::json!({ "limit": 100 }));
+        if let Some(found) = listed["segments"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["segment_id"] == segment_id))
+        {
+            row = found.clone();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        row.is_object(),
+        "閉合後 list_segments 必須有同一個 segment_id：{segment_id}"
+    );
+    assert_eq!(row["t_start_ms"].as_u64(), Some(t_start), "同一段的 t_start_ms");
+    assert_eq!(
+        row["name"].as_str(),
+        Some(format!("{segment_id}.mkv").as_str()),
+        "閉合後 name 應是 .mkv（不含 .part）"
+    );
+    daemon.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn dir_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn file_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// B3：已存在的父目錄一個位元都不動；只有自己新建的目錄才是 0700。socket 一律 0600。
+#[test]
+fn socket_dir_permissions_leave_existing_parent_alone() {
+    // 情境 1：父目錄已存在（0755，像 /tmp），不能被改成 0700。
+    let dir = unique_dir("perm-existing");
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let socket = dir.join("camd.sock");
+    let mut daemon = Daemon::start(&dir, &socket, "rtsp://127.0.0.1:1/test.264");
+    assert_eq!(dir_mode(&dir), 0o755, "已存在的目錄權限不得被改動");
+    assert_eq!(file_mode(&socket), 0o600, "socket 必須是 0600");
+    daemon.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 情境 2：父目錄不存在 → camd 自己建立，必須是 0700。
+    let dir = unique_dir("perm-new");
+    let nested = dir.join("nested");
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = nested.join("camd.sock");
+    let mut daemon = Daemon::start(&dir, &socket, "rtsp://127.0.0.1:1/test.264");
+    assert_eq!(dir_mode(&nested), 0o700, "自己新建的目錄必須是 0700");
+    assert_eq!(file_mode(&socket), 0o600, "socket 必須是 0600");
+    daemon.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
