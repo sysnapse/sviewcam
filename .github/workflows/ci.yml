@@ -67,12 +67,26 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # M3 的驗收測試會 spawn `target/debug/camd` 與 `camd-replay`；`cargo test` 不保證
+      # 先把其他 package 的 bin 建好，這裡先明建一次（仍然 `--locked`）。
+      - name: cargo build --workspace --bins
+        run: cargo build --workspace --locked --bins
+
       # 驗收標準 1：workspace 全測試（M0 29 個 + camcore 單元 + M1 AC1–AC4；AC5 標 ignored）。
       #
       # 一律加 `--locked`：沒有它的 CI 擋不住「manifest 改了但 Cargo.lock 沒跟上」——
       # 測試照樣在 CI 綠，release 建置用 --locked 才爆出來，等於把問題延後到出貨前。
       - name: cargo test --workspace
         run: cargo test --workspace --locked
+
+      # 解碼失敗時測試會把段檔留在 target/k15-fail-*.mkv；上傳讓失敗可追。
+      - name: Upload failing segments
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k15-failing-segments
+          path: target/k15-fail-*.mkv
+          if-no-files-found: ignore
 
       # M1 AC3：SIGKILL → 復原掃描，對每個閉合段跑真 ffprobe。
       # 單獨再跑一次是為了 --nocapture：讓 ffprobe 的原始 JSON 進 CI log 當證據，
