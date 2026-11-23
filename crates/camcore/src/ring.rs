@@ -212,9 +212,11 @@ impl RingWriter {
             return Ok(());
         }
         if self.cur.is_none() {
-            // 還沒開始錄，空窗不影響任何段；仍留記錄
+            // 還沒開始錄，空窗不影響已存在的段；仍留記錄，並讓**下一個**段如實帶上
+            // `gap_ms`（例：camd 重啟後第一段，重啟前後的空窗不能寫成 0＝假連續）。
             self.index
                 .insert_event(at_ms, "gap", &format!("{gap_ms} ms 空窗（尚未開段）：{reason}"))?;
+            self.pending_gap = Some((gap_ms, reason.to_string()));
             return Ok(());
         }
         let end = at_ms.saturating_sub(gap_ms);
