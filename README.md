@@ -207,6 +207,61 @@ harness 在驗收環境跑不起來；`fixtures/gen_sview_m0.py`（重生 fixtur
 **不要寫死 60 秒**：60–64 s 只是「≥45 s」這個門檻下的一個觀測值；若日後實測發現回收週期改變，
 改設定即可，不用改狀態機。
 
+## camd 常駐錄影與 camctl（M3 切片 1）
+
+`camd` 是常駐程序：拉流 → 寫段 → 更新索引，控制面只有一個 Unix socket。`camctl status`
+與 `camctl list-segments` 透過它查狀態，不用碰索引檔。
+
+**socket 路徑解析順序**（第一個存在者為準，`--socket` 最優先）：
+
+1. `--socket <path>`
+2. `$SVCAM_SOCKET`
+3. `$XDG_RUNTIME_DIR/sviewcam/camd.sock`
+4. `$HOME/.local/state/sviewcam/camd.sock`
+
+**協議**：每行一個 JSON。請求 `{"id":1,"proto_version":1,"method":"status","params":{}}`，
+回應 `{"id":1,"result":{…}}` 或 `{"id":1,"error":{"code":"…","message":"…"}}`。
+`proto_version` 必須是 `1`；版本檢查在 method dispatch **之前**（`ping` 也不例外），
+不符回 `PROTO_VERSION` 且 camd 不退出、連線可以繼續送正確版本。
+
+方法只有三個：
+
+| method | params | 說明 |
+|---|---|---|
+| `status` | — | `camd{version,pid,uptime_ms,socket,data_dir}`、`camera{state,last_frame_uptime_ms,reconnects,next_retry_ms,last_error}`、`recording{current_segment,segments,total_bytes,latest_end_ms,last_error}`、`fps` |
+| `list_segments` | `from`／`to`（可選，串流毫秒）、`limit`（1–1000，預設 100） | 最近 `limit` 筆，回 `segment_id/name/t_start/t_end/bytes/first_block_keyframe/gap_ms` |
+| `ping` | — | `{pong,uptime_ms,proto_version}` |
+
+**時間基準只有一個**：索引的 `t_start`／`t_end`（串流毫秒）。`uptime_ms` 是 host 時間，
+兩者不互換；`camctl list-segments --from -3m` 的錨點是 `status.recording.latest_end_ms`
+（不是 `now`），`--json` 會印換算後的 `from_ms`／`to_ms`。
+
+**`fps` 目前固定是 `null`**：`FpsEstimator` 需要 RTP 90 kHz timestamp，切片 1 的
+`NalSink::nal_at` 只有串流毫秒；把 RTP timestamp 帶進 sink 是切片 2 的事，這裡不硬湊。
+
+**錯誤碼**：`BAD_REQUEST`（JSON 壞或欄位缺）、`UNKNOWN_METHOD`、`BAD_PARAMS`（
+`from > to`、`limit` 超界）、`PROTO_VERSION`（帶 `data{expected,got}`）、
+`LINE_TOO_LONG`（單行 >64 KiB，只關該連線、camd 不退出、其他連線照服務）、`INTERNAL`。
+
+**camd 行為**：
+
+- 啟動順序是「先 `recover` 再 bind socket」：復原掃描跑完才對外服務，`status` 看到的
+  索引不是半復原狀態。
+- 單實例：`camd.lock` 與 socket 同目錄，內容是 pid。第二個 camd 非零 exit，訊息
+  `camd 已在執行（pid N，socket …，鎖 …）`；stale lock（pid 不存在）會接手。
+- 無相機時不退出：退避 1 s → 2 s → 4 s …（上限 30 s），`status.camera.state` 會是
+  `Disconnected` 或 `WaitingForNic`（DNS／網路不可達）。
+- 跨行程時間軸：`camd.timeline` 記住上次寫到的串流時間，重啟後從那裡接續，空窗
+  **等到第一個 IDR 才開段**並如實記進 `gap_ms`；不會出現「時間倒退造成的重疊段」。
+
+**`camctl status`／`list-segments` 退出碼**：`0` 成功；`2` socket 不存在／連不上／
+協議錯誤（`PROTO_VERSION`、`BAD_PARAMS` 等，錯誤訊息會印解析出的 socket 路徑）。
+`--json` 把協議 JSON 原樣寫 stdout，人看的摘要一律走 stderr。
+
+**`camd-replay` 只給測試用**：CI 沒有相機，`camd-replay` 開一個假 RTSP 端點（
+`--h264 <file>` 可餵真 Annex B 視訊，否則送確定性合成 bitstream）。正式 `camd`
+沒有 `--input` 這類旗標，正常 RTSP 路徑完全不知道它的存在。
+
 ## 權杖紀律
 
 SViewWifi 權杖由使用者從自己的配對資料／抓包取得：

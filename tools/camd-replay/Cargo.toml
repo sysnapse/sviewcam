@@ -1,0 +1,14 @@
+[package]
+name = "camd-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "測試用假相機：RTSP/1.0 + UDP RTP（確定性合成 H.264），供 M3 AC 驗收"
+
+[[bin]]
+name = "camd-replay"
+path = "src/main.rs"
+
+[dependencies]
+rtsp-core = { path = "../../crates/rtsp-core" }
+clap = { version = "4", features = ["derive"] }

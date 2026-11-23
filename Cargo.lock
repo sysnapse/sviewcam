@@ -96,6 +96,7 @@ name = "camctl"
 version = "0.1.0"
 dependencies = [
  "camcore",
+ "camipc",
  "clap",
  "libc",
  "rtsp-core",
@@ -113,6 +114,14 @@ dependencies = [
  "rtsp-core",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "camd-replay"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rtsp-core",
 ]
 
 [[package]]
