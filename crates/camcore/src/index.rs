@@ -192,7 +192,7 @@ impl SegmentIndex {
                 params![
                     0i64,
                     "schema_upgrade",
-                    "索引 schema 由 v2 升級到 v3：新增 first_block_keyframe（既有列 NULL＝未知，recover 掃到時補真值）"
+                    "索引 schema 由 v2 升級到 v3：新增 first_block_keyframe（既有列保持 NULL＝未知；只有 recover 掃到的新檔、孤兒與 .part 會補真值）"
                 ],
             )?;
         }
@@ -699,6 +699,18 @@ mod tests {
             idx.count_events("schema_upgrade").unwrap(),
             1,
             "v2→v3 恰一筆 schema_upgrade"
+        );
+        // 文案必須與事實一致：只有 recover 掃到的新檔、孤兒與 .part 會補值，
+        // 既有列升級後永遠是 NULL。
+        let upgrades = idx.events().unwrap();
+        let detail = upgrades
+            .iter()
+            .find(|e| e.kind == "schema_upgrade")
+            .map(|e| e.detail.as_str())
+            .expect("v2→v3 要留 schema_upgrade 事件");
+        assert!(
+            detail.contains("既有列保持 NULL"),
+            "schema_upgrade 文案必須說明既有列不補值：{detail}"
         );
         std::fs::remove_file(&path).ok();
     }

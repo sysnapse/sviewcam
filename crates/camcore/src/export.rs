@@ -4,6 +4,16 @@
 //! 所以切點永遠落在 GOP 邊界，不會切出半個 GOP；`-c copy` 不重編碼。
 //! 段與段之間若有 gap（`SegmentRow.gap_ms`），一定分檔輸出並在 stderr 列出時點，
 //! 不把空窗靜默接成連續畫面。
+//!
+//! ## 可獨立解碼的判定
+//!
+//! 一個段能不能當輸出的起點，只看 `SegmentRow.first_block_keyframe`：
+//! `Some(true)` 可以、`Some(false)` 不行、`None`（v3 以前的列）現場用
+//! `mkv::scan()` 掃段檔第一個 SimpleBlock 的 flags。**不得改用 `idr_offset` 判定**：
+//! k24 的 4×`force_cut_ms` 硬切上限會在沒有 IDR 時直接切段，這種段沒有 keyframe、
+//! `idr_offset` 是 0；但 `idr_offset` 的語義是「檔案內第一個 keyframe 的位移」，
+//! 不是「段首就是 keyframe」，且舊資料／未知來源的值不保證被回填。選段只信旗標與
+//! 現場掃描結果，不從 `idr_offset` 推論可解性。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -764,5 +774,81 @@ mod tests {
         let a = row("seg-000000000000.mkv", 0, 3_000, Some(0));
         let b = row("seg-000000002000.mkv", 2_000, 4_000, Some(0));
         assert!(matches!(kind(&a, &b), GapKind::Gap { .. }));
+    }
+
+    // ---- 可獨立解碼的判定：只看 first_block_keyframe，不看 idr_offset ----
+
+    fn avc() -> crate::mkv::AvcConfig {
+        crate::mkv::AvcConfig {
+            sps: vec![0x67, 0x64, 0x00, 0x28, 0xAC, 0xD9],
+            pps: vec![0x68, 0xEE, 0x3C, 0x80],
+        }
+    }
+
+    fn scan_tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("camcore-export-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("建立暫存目錄");
+        dir
+    }
+
+    /// 寫一個兩 block 的小段檔；`first_keyframe` 決定段首是 IDR（0x65）還是 P（0x41）。
+    fn write_scan_segment(dir: &Path, first_keyframe: bool) -> String {
+        let name = "seg-000000000000.mkv".to_string();
+        let path = dir.join(&name);
+        let mut writer = crate::mkv::MkvWriter::create(&path, &avc(), 640, 480, 0).unwrap();
+        let first = if first_keyframe { 0x65 } else { 0x41 };
+        writer
+            .append_block(
+                &crate::mkv::avcc_frame(&[first, 1, 2, 3]),
+                0,
+                first_keyframe,
+            )
+            .unwrap();
+        writer
+            .append_block(&crate::mkv::avcc_frame(&[0x41, 4]), 40, false)
+            .unwrap();
+        writer.finish().unwrap();
+        name
+    }
+
+    /// k24 硬切段的形狀：`first_block_keyframe=Some(false)` 且 `idr_offset=0`。
+    /// 旗標已明確不可解，不得因為 `idr_offset` 是 0 或目錄不存在而放行／去掃描。
+    #[test]
+    fn p_first_flag_with_zero_idr_offset_is_not_playable() {
+        let mut r = row("seg-000000016000.mkv", 16_000, 32_000, Some(0));
+        r.first_block_keyframe = Some(false);
+        r.idr_offset = 0;
+        assert!(!playable_first_block(Path::new("/nonexistent-k25"), &r).unwrap());
+    }
+
+    /// `None`（v3 以前的列）要現場掃描：段首不是 keyframe 就不可解。
+    #[test]
+    fn null_flag_scans_and_rejects_p_first_segment() {
+        let dir = scan_tmp_dir("scan-pfirst");
+        let name = write_scan_segment(&dir, false);
+        let mut r = row(&name, 0, 80, Some(0));
+        r.first_block_keyframe = None;
+        r.idr_offset = 0;
+        assert!(
+            !playable_first_block(&dir, &r).unwrap(),
+            "NULL 要掃描：段首非 keyframe 必須判為不可解"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 對照組：同一條掃描路徑掃到段首 IDR 要放行，證明上一條不是永遠 false。
+    #[test]
+    fn null_flag_scans_and_accepts_keyframe_segment() {
+        let dir = scan_tmp_dir("scan-kf");
+        let name = write_scan_segment(&dir, true);
+        let mut r = row(&name, 0, 80, Some(0));
+        r.first_block_keyframe = None;
+        r.idr_offset = 0;
+        assert!(
+            playable_first_block(&dir, &r).unwrap(),
+            "掃描到段首 IDR 必須可解"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

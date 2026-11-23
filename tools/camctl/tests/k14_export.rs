@@ -449,3 +449,56 @@ fn unknown_gap_is_reported_as_unknown_in_text_stderr() {
         "未知 gap 應分成兩個輸出：{stdout}"
     );
 }
+
+/// AC3（k25）：可獨立解碼只看 `first_block_keyframe`，不看 `idr_offset`。
+///
+/// 把第一列改成 k24 硬切段的形狀（`first_block_keyframe=Some(false)`、`idr_offset=0`），
+/// 匯出必須把它放進 `excluded_segments[]`，且不得出現在任何輸出段清單裡。
+#[test]
+fn zero_idr_offset_p_first_row_is_excluded_by_flag() {
+    require_ffmpeg();
+    let dir = temp_dir("k25-idr-offset");
+    run_replay(&dir);
+    let index = open_index(&dir);
+    let rows = index.rows().expect("索引 rows");
+    assert!(rows.len() >= 2, "需要至少兩個段：{}", rows.len());
+    let victim = rows[0].clone();
+    let mut doctored = victim.clone();
+    doctored.first_block_keyframe = Some(false);
+    doctored.idr_offset = 0;
+    index.upsert(&doctored).expect("改索引列");
+    drop(index);
+
+    // 範圍要包住第一個段（`-100s` 只蓋到 63.46 s，碰不到它；ac4_gap 全長 163.46 s）。
+    let output = dir.join("export.mp4");
+    let out = run_export(&dir, &output, "-161s", "0");
+    assert!(
+        out.status.success(),
+        "camctl export 失敗：rc={:?}\nstdout={}\nstderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout 必須是 JSON");
+    let excluded = report["excluded_segments"]
+        .as_array()
+        .expect("excluded_segments[]");
+    let hit = excluded
+        .iter()
+        .find(|e| e["id"] == victim.segment_id.as_str())
+        .unwrap_or_else(|| panic!("idr_offset=0 的 P-first 段必須被排除：{report}"));
+    assert!(
+        !hit["reason"].as_str().unwrap_or("").is_empty(),
+        "排除必須附原因：{report}"
+    );
+    for item in report["outputs"].as_array().expect("outputs[]") {
+        let segments = item["segments"].as_array().expect("segments[]");
+        assert!(
+            !segments
+                .iter()
+                .any(|s| s.as_str() == Some(victim.segment_id.as_str())),
+            "被排除的段不得出現在輸出：{item}"
+        );
+    }
+}
