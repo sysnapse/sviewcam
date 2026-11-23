@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/camcore", "crates/rtsp-core", "tools/probe", "tools/replay", "tools/camctl"]
+members = ["bins/camd", "crates/camcore", "crates/camipc", "crates/rtsp-core", "tools/camd-replay", "tools/probe", "tools/replay", "tools/camctl"]
 
 [workspace.package]
 version = "0.1.0"

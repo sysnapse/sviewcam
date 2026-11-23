@@ -103,6 +103,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "camd"
+version = "0.1.0"
+dependencies = [
+ "camcore",
+ "camipc",
+ "clap",
+ "libc",
+ "rtsp-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "camipc"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

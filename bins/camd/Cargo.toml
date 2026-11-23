@@ -1,0 +1,26 @@
+[package]
+name = "camd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SViewCam camd 常駐服務（M3 切片 1）：拉流、寫段、索引、控制 socket"
+
+[lib]
+name = "camd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "camd"
+path = "src/main.rs"
+
+[dependencies]
+camcore = { path = "../../crates/camcore" }
+camipc = { path = "../../crates/camipc" }
+clap = { version = "4", features = ["derive"] }
+rtsp-core = { path = "../../crates/rtsp-core" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1"
